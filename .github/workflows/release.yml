@@ -46,29 +46,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: "macos-26" # for Arm based macs (M1 and above). Uses macOS 26 for Apple Intelligence SDK.
-            args: "--target aarch64-apple-darwin"
-            target: "aarch64-apple-darwin"
-            apple_signing: false
-          - platform: "macos-latest" # for Intel based macs.
-            args: "--target x86_64-apple-darwin"
-            target: "x86_64-apple-darwin"
-            apple_signing: false
           - platform: "ubuntu-22.04" # Build .deb on 22.04
             args: "--bundles deb"
             target: "x86_64-unknown-linux-gnu"
             apple_signing: true
+
           - platform: "ubuntu-24.04" # Build AppImage and RPM on 24.04
             args: "--bundles appimage,rpm"
             target: "x86_64-unknown-linux-gnu"
             apple_signing: true
+
           - platform: "ubuntu-24.04-arm" # Build for ARM64 Linux
             args: "--bundles appimage,deb,rpm"
             target: "aarch64-unknown-linux-gnu"
             apple_signing: true
+
           - platform: "windows-latest" # Windows x64
             args: "--bundles nsis,msi"
             target: "x86_64-pc-windows-msvc"
+
           - platform: "windows-11-arm" # Windows ARM64
             args: "--target aarch64-pc-windows-msvc"
             target: "aarch64-pc-windows-msvc"
@@ -90,6 +86,7 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     needs: [create-release, publish-tauri]
+    if: ${{ !cancelled() && needs.create-release.result == 'success' }}
     steps:
       - name: Publish Release
         uses: actions/github-script@v7
