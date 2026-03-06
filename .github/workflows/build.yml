@@ -183,9 +183,45 @@ jobs:
           vulkan-components: Vulkan-Headers, Vulkan-Loader
           vulkan-use-cache: true
 
+      - name: Check signing secrets availability
+        id: signing-check
+        shell: bash
+        run: |
+          if [[ -n "$APPLE_CERT" ]]; then
+            echo "has-apple-cert=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-apple-cert=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Apple certificate not configured"
+          fi
+          if [[ -n "$AZURE_ID" ]]; then
+            echo "has-azure-signing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-azure-signing=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Azure signing credentials not configured"
+          fi
+          if [[ -n "$SIGNING_KEY" ]]; then
+            echo "has-signing-key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-signing-key=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ Tauri updater signing key not configured"
+          fi
+        env:
+          APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          AZURE_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+
       - name: Install trusted-signing-cli
-        if: contains(inputs.platform, 'windows') && inputs.sign-binaries
+        if: contains(inputs.platform, 'windows') && inputs.sign-binaries && steps.signing-check.outputs.has-azure-signing == 'true'
         run: cargo install trusted-signing-cli
+
+      - name: Remove Windows sign command (no signing secrets)
+        if: contains(inputs.platform, 'windows') && steps.signing-check.outputs.has-azure-signing != 'true'
+        shell: bash
+        run: |
+          echo "Removing signCommand from tauri.conf.json (Azure signing secrets not available)"
+          sed -i 's/"signCommand":.*$//' src-tauri/tauri.conf.json
+          # Clean up any trailing commas that may result from removal
+          sed -i ':a;N;$!ba;s/,\n[[:space:]]*}/\n}/g' src-tauri/tauri.conf.json
 
       - name: Prepare Vulkan SDK for Ubuntu 24.04
         if: contains(inputs.platform, 'ubuntu-24.04') && !contains(inputs.platform, 'arm')
@@ -231,7 +267,7 @@ jobs:
         run: rustup target add ${{ inputs.target }}
 
       - name: import Apple Developer Certificate
-        if: contains(inputs.platform, 'macos') && inputs.apple_signing
+        if: contains(inputs.platform, 'macos') && inputs.sign-binaries && steps.signing-check.outputs.has-apple-cert == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -247,13 +283,12 @@ jobs:
           security find-identity -v -p codesigning build.keychain
 
       - name: verify certificate
-        if: contains(inputs.platform, 'macos') && inputs.apple_signing
+        if: contains(inputs.platform, 'macos') && inputs.sign-binaries && steps.signing-check.outputs.has-apple-cert == 'true'
         run: |
           CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application")
           CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
           echo "CERT_ID=$CERT_ID" >> $GITHUB_ENV
           echo "Certificate imported."
-
       - name: Patch asset name pattern
         id: patch-release-name
         shell: bash
@@ -266,6 +301,32 @@ jobs:
             patched_platform="${{ inputs.asset-prefix }}_${patched_platform}"
           fi
           echo "platform=${patched_platform}" >> $GITHUB_OUTPUT
+
+      - name: Configure updater signing
+        if: inputs.sign-binaries && steps.signing-check.outputs.has-signing-key == 'true'
+        shell: bash
+        run: |
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY<<TAURI_KEY_DELIMITER"
+            echo "$SIGNING_KEY"
+            echo "TAURI_KEY_DELIMITER"
+          } >> "$GITHUB_ENV"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$SIGNING_PASSWORD" >> "$GITHUB_ENV"
+          echo "✅ Updater signing key configured"
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Disable updater artifacts signing (no key available)
+        if: steps.signing-check.outputs.has-signing-key != 'true'
+        shell: bash
+        run: |
+          echo "⚠️ Disabling createUpdaterArtifacts (no signing key available)"
+          if [[ "$(uname)" == "Darwin" ]]; then
+            sed -i '' 's/"createUpdaterArtifacts": true/"createUpdaterArtifacts": false/' src-tauri/tauri.conf.json
+          else
+            sed -i 's/"createUpdaterArtifacts": true/"createUpdaterArtifacts": false/' src-tauri/tauri.conf.json
+          fi
 
       - name: Build with Tauri
         if: inputs.apple_signing
@@ -301,8 +362,6 @@ jobs:
           AZURE_CLIENT_ID: ${{ inputs.sign-binaries && secrets.AZURE_CLIENT_ID || '' }}
           AZURE_CLIENT_SECRET: ${{ inputs.sign-binaries && secrets.AZURE_CLIENT_SECRET || '' }}
           AZURE_TENANT_ID: ${{ inputs.sign-binaries && secrets.AZURE_TENANT_ID || '' }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ inputs.sign-binaries && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ inputs.sign-binaries && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
           WHISPER_NO_AVX: ${{ contains(inputs.platform, 'ubuntu') && !contains(inputs.platform, 'arm') && 'ON' || '' }}
           WHISPER_NO_AVX2: ${{ contains(inputs.platform, 'ubuntu') && !contains(inputs.platform, 'arm') && 'ON' || '' }}
         with:
