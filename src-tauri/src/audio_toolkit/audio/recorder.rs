@@ -1,8 +1,10 @@
 use std::{
     io::Error,
+    panic::{self, AssertUnwindSafe},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc::{self, RecvTimeoutError},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -87,49 +89,86 @@ impl AudioRecorder {
         let pause_flag = self.pause_flag.clone();
 
         let worker = std::thread::spawn(move || {
-            let config = AudioRecorder::get_preferred_config(&thread_device)
-                .expect("failed to fetch preferred config");
+            let worker_result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), String> {
+                let config = AudioRecorder::get_preferred_config(&thread_device)
+                    .map_err(|err| format!("failed to fetch preferred config: {err}"))?;
 
-            let sample_rate = config.sample_rate().0;
-            let channels = config.channels() as usize;
+                let sample_rate = config.sample_rate().0;
+                let channels = config.channels() as usize;
 
-            log::info!(
-                "Using device: {:?}\nSample rate: {}\nChannels: {}\nFormat: {:?}",
-                thread_device.name(),
-                sample_rate,
-                channels,
-                config.sample_format()
-            );
+                log::info!(
+                    "Using device: {:?}\nSample rate: {}\nChannels: {}\nFormat: {:?}",
+                    thread_device.name(),
+                    sample_rate,
+                    channels,
+                    config.sample_format()
+                );
 
-            let stream = match config.sample_format() {
-                cpal::SampleFormat::U8 => {
-                    AudioRecorder::build_stream::<u8>(&thread_device, &config, sample_tx, channels)
-                        .unwrap()
+                let stream = match config.sample_format() {
+                    cpal::SampleFormat::U8 => AudioRecorder::build_stream::<u8>(
+                        &thread_device,
+                        &config,
+                        sample_tx,
+                        channels,
+                    ),
+                    cpal::SampleFormat::I8 => AudioRecorder::build_stream::<i8>(
+                        &thread_device,
+                        &config,
+                        sample_tx,
+                        channels,
+                    ),
+                    cpal::SampleFormat::I16 => AudioRecorder::build_stream::<i16>(
+                        &thread_device,
+                        &config,
+                        sample_tx,
+                        channels,
+                    ),
+                    cpal::SampleFormat::I32 => AudioRecorder::build_stream::<i32>(
+                        &thread_device,
+                        &config,
+                        sample_tx,
+                        channels,
+                    ),
+                    cpal::SampleFormat::F32 => AudioRecorder::build_stream::<f32>(
+                        &thread_device,
+                        &config,
+                        sample_tx,
+                        channels,
+                    ),
+                    other => {
+                        return Err(format!("unsupported sample format: {other:?}"));
+                    }
                 }
-                cpal::SampleFormat::I8 => {
-                    AudioRecorder::build_stream::<i8>(&thread_device, &config, sample_tx, channels)
-                        .unwrap()
-                }
-                cpal::SampleFormat::I16 => {
-                    AudioRecorder::build_stream::<i16>(&thread_device, &config, sample_tx, channels)
-                        .unwrap()
-                }
-                cpal::SampleFormat::I32 => {
-                    AudioRecorder::build_stream::<i32>(&thread_device, &config, sample_tx, channels)
-                        .unwrap()
-                }
-                cpal::SampleFormat::F32 => {
-                    AudioRecorder::build_stream::<f32>(&thread_device, &config, sample_tx, channels)
-                        .unwrap()
-                }
-                _ => panic!("unsupported sample format"),
-            };
+                .map_err(|err| format!("failed to build input stream: {err}"))?;
 
-            stream.play().expect("failed to start stream");
+                stream
+                    .play()
+                    .map_err(|err| format!("failed to start input stream: {err}"))?;
 
-            // keep the stream alive while we process samples
-            run_consumer(sample_rate, vad, sample_rx, cmd_rx, level_cb, pause_flag);
-            // stream is dropped here, after run_consumer returns
+                // Keep the stream alive while we process samples.
+                run_consumer(sample_rate, vad, sample_rx, cmd_rx, level_cb, pause_flag);
+                Ok(())
+            }));
+
+            match worker_result {
+                Ok(Ok(())) => {
+                    log::debug!("Audio recorder worker exited cleanly");
+                }
+                Ok(Err(err)) => {
+                    log::error!("Audio recorder worker exited with error: {err}");
+                }
+                Err(panic_payload) => {
+                    let panic_message = if let Some(message) = panic_payload.downcast_ref::<&str>()
+                    {
+                        (*message).to_string()
+                    } else if let Some(message) = panic_payload.downcast_ref::<String>() {
+                        message.clone()
+                    } else {
+                        "non-string panic payload".to_string()
+                    };
+                    log::error!("Audio recorder worker panicked: {panic_message}");
+                }
+            }
         });
 
         self.device = Some(device);
@@ -299,10 +338,63 @@ fn run_consumer(
         }
     }
 
+    fn handle_command(
+        cmd: Cmd,
+        sample_rx: &mpsc::Receiver<Vec<f32>>,
+        frame_resampler: &mut FrameResampler,
+        processed_samples: &mut Vec<f32>,
+        recording: &mut bool,
+        vad: &Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
+        visualizer: &mut AudioVisualiser,
+    ) -> bool {
+        match cmd {
+            Cmd::Start => {
+                processed_samples.clear();
+                *recording = true;
+                visualizer.reset();
+                if let Some(v) = vad {
+                    v.lock().unwrap().reset();
+                }
+                false
+            }
+            Cmd::Stop(reply_tx) => {
+                *recording = false;
+
+                while let Ok(remaining) = sample_rx.try_recv() {
+                    frame_resampler.push(&remaining, &mut |frame: &[f32]| {
+                        handle_frame(frame, true, vad, processed_samples)
+                    });
+                }
+
+                frame_resampler
+                    .finish(&mut |frame: &[f32]| handle_frame(frame, true, vad, processed_samples));
+
+                let _ = reply_tx.send(std::mem::take(processed_samples));
+                false
+            }
+            Cmd::Shutdown => true,
+        }
+    }
+
     loop {
-        let raw = match sample_rx.recv() {
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            if handle_command(
+                cmd,
+                &sample_rx,
+                &mut frame_resampler,
+                &mut processed_samples,
+                &mut recording,
+                &vad,
+                &mut visualizer,
+            ) {
+                return;
+            }
+        }
+
+        let raw = match sample_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(s) => s,
-            Err(_) => break, // stream closed
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
         };
 
         // ---------- spectrum processing ---------------------------------- //
@@ -324,33 +416,48 @@ fn run_consumer(
 
         // non-blocking check for a command
         while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                Cmd::Start => {
-                    processed_samples.clear();
-                    recording = true;
-                    visualizer.reset(); // Reset visualization buffer
-                    if let Some(v) = &vad {
-                        v.lock().unwrap().reset();
-                    }
-                }
-                Cmd::Stop(reply_tx) => {
-                    recording = false;
-
-                    // Drain any audio chunks that were captured but not yet consumed
-                    while let Ok(remaining) = sample_rx.try_recv() {
-                        frame_resampler.push(&remaining, &mut |frame: &[f32]| {
-                            handle_frame(frame, true, &vad, &mut processed_samples)
-                        });
-                    }
-
-                    frame_resampler.finish(&mut |frame: &[f32]| {
-                        handle_frame(frame, true, &vad, &mut processed_samples)
-                    });
-
-                    let _ = reply_tx.send(std::mem::take(&mut processed_samples));
-                }
-                Cmd::Shutdown => return,
+            if handle_command(
+                cmd,
+                &sample_rx,
+                &mut frame_resampler,
+                &mut processed_samples,
+                &mut recording,
+                &vad,
+                &mut visualizer,
+            ) {
+                return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{run_consumer, Cmd};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn shutdown_command_exits_without_waiting_for_samples() {
+        let (sample_tx, sample_rx) = mpsc::channel::<Vec<f32>>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+
+        let worker = std::thread::spawn(move || {
+            run_consumer(16_000, None, sample_rx, cmd_rx, None, None);
+        });
+
+        cmd_tx.send(Cmd::Shutdown).expect("send shutdown");
+
+        let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = worker.join();
+            let _ = joined_tx.send(());
+        });
+
+        joined_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker should exit after shutdown");
+
+        drop(sample_tx);
     }
 }

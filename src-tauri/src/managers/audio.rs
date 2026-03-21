@@ -534,4 +534,17 @@ impl AudioRecordingManager {
             }
         }
     }
+
+    pub fn shutdown(&self) {
+        debug!("Shutting down AudioRecordingManager");
+        self.cancel_recording();
+        self.stop_microphone_stream();
+        self.remove_mute();
+    }
+}
+
+impl Drop for AudioRecordingManager {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
