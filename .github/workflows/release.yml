@@ -64,10 +64,12 @@ jobs:
           - platform: "windows-latest" # Windows x64
             args: "--bundles nsis,msi"
             target: "x86_64-pc-windows-msvc"
+            apple_signing: false
 
           - platform: "windows-11-arm" # Windows ARM64
             args: "--target aarch64-pc-windows-msvc"
             target: "aarch64-pc-windows-msvc"
+            apple_signing: false
 
     uses: ./.github/workflows/build.yml
     with:
