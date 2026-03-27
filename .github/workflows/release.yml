@@ -27,11 +27,44 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
+            const tag = `v${{ steps.get-version.outputs.version }}`;
+
+            // Clean up any existing release for this tag (from a previous run)
+            try {
+              const existing = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: tag
+              });
+              console.log(`Found existing release (id: ${existing.data.id}, draft: ${existing.data.draft}). Deleting it...`);
+              await github.rest.repos.deleteRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: existing.data.id
+              });
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              console.log('No existing release found for this tag.');
+            }
+
+            // Clean up any existing git tag (left over from a previous release)
+            try {
+              await github.rest.git.deleteRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${tag}`
+              });
+              console.log(`Deleted existing tag ${tag}`);
+            } catch (e) {
+              if (e.status !== 404 && e.status !== 422) throw e;
+              console.log('No existing tag to delete.');
+            }
+
             const { data } = await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              tag_name: `v${{ steps.get-version.outputs.version }}`,
-              name: `v${{ steps.get-version.outputs.version }}`,
+              tag_name: tag,
+              name: tag,
               draft: true,
               prerelease: false,
               generate_release_notes: true
@@ -49,17 +82,17 @@ jobs:
           - platform: "ubuntu-22.04" # Build .deb on 22.04
             args: "--bundles deb"
             target: "x86_64-unknown-linux-gnu"
-            apple_signing: true
+            apple_signing: false
 
           - platform: "ubuntu-24.04" # Build AppImage and RPM on 24.04
             args: "--bundles appimage,rpm"
             target: "x86_64-unknown-linux-gnu"
-            apple_signing: true
+            apple_signing: false
 
           - platform: "ubuntu-24.04-arm" # Build for ARM64 Linux
             args: "--bundles appimage,deb,rpm"
             target: "aarch64-unknown-linux-gnu"
-            apple_signing: true
+            apple_signing: false
 
           - platform: "windows-latest" # Windows x64
             args: "--bundles nsis,msi"
