@@ -513,7 +513,10 @@ impl ModelManager {
         let mut models = self.available_models.lock().unwrap();
 
         for model in models.values_mut() {
-            if matches!(model.engine_type, EngineType::GeminiApi | EngineType::InsanelyFastWhisper) {
+            if matches!(
+                model.engine_type,
+                EngineType::GeminiApi | EngineType::InsanelyFastWhisper
+            ) {
                 continue;
             }
             if model.is_directory {
@@ -589,7 +592,11 @@ impl ModelManager {
         if settings.selected_model.is_empty() {
             let models = self.available_models.lock().unwrap();
             if let Some(available_model) = models.values().find(|model| {
-                model.is_downloaded && !matches!(model.engine_type, EngineType::GeminiApi | EngineType::InsanelyFastWhisper)
+                model.is_downloaded
+                    && !matches!(
+                        model.engine_type,
+                        EngineType::GeminiApi | EngineType::InsanelyFastWhisper
+                    )
             }) {
                 info!(
                     "Auto-selecting model: {} ({})",
@@ -736,7 +743,10 @@ impl ModelManager {
         let model_info =
             model_info.ok_or_else(|| anyhow::anyhow!("Model not found: {}", model_id))?;
 
-        if matches!(model_info.engine_type, EngineType::GeminiApi | EngineType::InsanelyFastWhisper) {
+        if matches!(
+            model_info.engine_type,
+            EngineType::GeminiApi | EngineType::InsanelyFastWhisper
+        ) {
             return Ok(());
         }
 
@@ -1092,7 +1102,10 @@ impl ModelManager {
         let model_info =
             model_info.ok_or_else(|| anyhow::anyhow!("Model not found: {}", model_id))?;
 
-        if matches!(model_info.engine_type, EngineType::GeminiApi | EngineType::InsanelyFastWhisper) {
+        if matches!(
+            model_info.engine_type,
+            EngineType::GeminiApi | EngineType::InsanelyFastWhisper
+        ) {
             return Err(anyhow::anyhow!("Cannot delete cloud model"));
         }
 
@@ -1160,7 +1173,10 @@ impl ModelManager {
             .get_model_info(model_id)
             .ok_or_else(|| anyhow::anyhow!("Model not found: {}", model_id))?;
 
-        if matches!(model_info.engine_type, EngineType::GeminiApi | EngineType::InsanelyFastWhisper) {
+        if matches!(
+            model_info.engine_type,
+            EngineType::GeminiApi | EngineType::InsanelyFastWhisper
+        ) {
             return Err(anyhow::anyhow!(
                 "Cloud model has no local path: {}",
                 model_id

@@ -608,13 +608,10 @@ impl ShortcutAction for TranscribeAction {
                         );
 
                         // Fallback: if cheap model returned nothing on meaningful audio, retry with accurate model
-                        if transcription.is_empty()
-                            && duration_seconds > 1.0
-                            && !switched_model
-                        {
+                        if transcription.is_empty() && duration_seconds > 1.0 && !switched_model {
                             if let Some(ref long_model_id) = settings_for_model.long_audio_model {
-                                let already_using_long = original_model.as_deref()
-                                    == Some(long_model_id.as_str());
+                                let already_using_long =
+                                    original_model.as_deref() == Some(long_model_id.as_str());
                                 if !already_using_long {
                                     info!(
                                         "Transcription empty for {:.1}s audio, retrying with long audio model: {}",
