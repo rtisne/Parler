@@ -338,8 +338,8 @@ jobs:
         if: steps.signing-check.outputs.has-signing-key != 'true'
         shell: bash
         run: |
-          echo "⚠️ Disabling createUpdaterArtifacts (no signing key available)"
-          node -e 'var fs=require("fs"),c=JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json","utf8"));if(!c.bundle)c.bundle={};c.bundle.createUpdaterArtifacts=false;fs.writeFileSync("src-tauri/tauri.conf.json",JSON.stringify(c,null,2)+"\n");console.log("createUpdaterArtifacts disabled");'
+          echo "⚠️ Disabling createUpdaterArtifacts and removing pubkey (no signing key available)"
+          node -e 'var fs=require("fs"),c=JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json","utf8"));if(!c.bundle)c.bundle={};c.bundle.createUpdaterArtifacts=false;if(c.plugins&&c.plugins.updater)delete c.plugins.updater.pubkey;fs.writeFileSync("src-tauri/tauri.conf.json",JSON.stringify(c,null,2)+"\n");console.log("createUpdaterArtifacts disabled, pubkey removed");'
 
       - name: Build with Tauri
         if: inputs.apple_signing
