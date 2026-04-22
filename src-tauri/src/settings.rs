@@ -808,6 +808,7 @@ pub fn get_default_settings() -> AppSettings {
         long_audio_threshold_seconds: default_long_audio_threshold_seconds(),
         gemini_api_key: None,
         gemini_model: default_gemini_model(),
+        insanely_fast_whisper_model: None,
         post_process_actions: Vec::new(),
         saved_processing_models: Vec::new(),
     }
