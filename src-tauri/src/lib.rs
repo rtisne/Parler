@@ -453,19 +453,8 @@ pub fn run(cli_args: CliArgs) {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_process::init());
 
-    // Try to initialize the updater plugin, but don't fail if it's misconfigured
-    match tauri_plugin_updater::Builder::new().build() {
-        Ok(updater_plugin) => {
-            log::info!("Updater plugin initialized successfully");
-            builder = builder.plugin(updater_plugin);
-        }
-        Err(err) => {
-            log::warn!(
-                "Failed to initialize updater plugin (updates will be disabled): {}",
-                err
-            );
-        }
-    }
+    // Initialize the updater plugin
+    builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
 
     builder
         .plugin(tauri_plugin_os::init())

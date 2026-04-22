@@ -24,6 +24,31 @@ export default defineConfig(async () => ({
         main: resolve(__dirname, "index.html"),
         overlay: resolve(__dirname, "src/overlay/index.html"),
       },
+      output: {
+        manualChunks: (id) => {
+          // Split vendor dependencies into separate chunks
+          if (id.includes("node_modules")) {
+            // Core React dependencies in one chunk
+            if (id.includes("react") || id.includes("react-dom")) {
+              return "vendor-react";
+            }
+            // UI libraries (Radix UI, etc.)
+            if (id.includes("@radix-ui") || id.includes("@tabler/icons")) {
+              return "vendor-ui";
+            }
+            // i18n libraries
+            if (id.includes("i18next") || id.includes("react-i18next")) {
+              return "vendor-i18n";
+            }
+            // State management and utilities
+            if (id.includes("zustand") || id.includes("immer")) {
+              return "vendor-state";
+            }
+            // Everything else in a general vendor chunk
+            return "vendor-other";
+          }
+        },
+      },
     },
   },
 
