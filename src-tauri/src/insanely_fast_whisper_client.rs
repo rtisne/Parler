@@ -79,9 +79,8 @@ pub fn transcribe_audio(samples: &[f32], model_name: &str, language: &str) -> Re
     }
 
     // Parse the JSON output
-    let json_content = std::fs::read_to_string(&json_path).map_err(|e| {
-        anyhow::anyhow!("Failed to read insanely-fast-whisper output: {}", e)
-    })?;
+    let json_content = std::fs::read_to_string(&json_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read insanely-fast-whisper output: {}", e))?;
     let _ = std::fs::remove_file(&json_path);
 
     let transcript: TranscriptOutput = serde_json::from_str(&json_content).map_err(|e| {

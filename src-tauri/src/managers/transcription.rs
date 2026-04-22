@@ -244,7 +244,10 @@ impl TranscriptionManager {
             return Err(anyhow::anyhow!(error_msg));
         }
 
-        let model_path = if matches!(model_info.engine_type, EngineType::GeminiApi | EngineType::InsanelyFastWhisper) {
+        let model_path = if matches!(
+            model_info.engine_type,
+            EngineType::GeminiApi | EngineType::InsanelyFastWhisper
+        ) {
             std::path::PathBuf::new()
         } else {
             self.model_manager.get_model_path(model_id)?

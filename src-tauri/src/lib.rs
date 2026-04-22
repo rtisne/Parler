@@ -9,8 +9,8 @@ mod commands;
 mod crash_logging;
 pub mod gemini_client;
 mod helpers;
-pub mod insanely_fast_whisper_client;
 mod input;
+pub mod insanely_fast_whisper_client;
 mod llm_client;
 mod managers;
 mod overlay;
@@ -438,7 +438,7 @@ pub fn run(cli_args: CliArgs) {
         builder = builder.plugin(tauri_nspanel::init());
     }
 
-    builder
+    let mut builder = builder
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if args.iter().any(|a| a == "--toggle-transcription") {
                 signal_handle::send_transcription_input(app, "transcribe", "CLI");
@@ -451,8 +451,23 @@ pub fn run(cli_args: CliArgs) {
             }
         }))
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init());
+
+    // Try to initialize the updater plugin, but don't fail if it's misconfigured
+    match tauri_plugin_updater::Builder::new().build() {
+        Ok(updater_plugin) => {
+            log::info!("Updater plugin initialized successfully");
+            builder = builder.plugin(updater_plugin);
+        }
+        Err(err) => {
+            log::warn!(
+                "Failed to initialize updater plugin (updates will be disabled): {}",
+                err
+            );
+        }
+    }
+
+    builder
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_macos_permissions::init())
