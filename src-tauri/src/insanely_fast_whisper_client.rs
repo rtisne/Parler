@@ -22,7 +22,7 @@ fn encode_samples_to_wav(samples: &[f32]) -> Result<Vec<u8>> {
         let cursor = Cursor::new(&mut buffer);
         let mut writer = WavWriter::new(cursor, spec)?;
         for sample in samples {
-            let sample_i16 = (sample * i16::MAX as f32) as i16;
+            let sample_i16 = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
             writer.write_sample(sample_i16)?;
         }
         writer.finalize()?;
@@ -33,10 +33,14 @@ fn encode_samples_to_wav(samples: &[f32]) -> Result<Vec<u8>> {
 pub fn transcribe_audio(samples: &[f32], model_name: &str, language: &str) -> Result<String> {
     let wav_bytes = encode_samples_to_wav(samples)?;
 
-    // Write to a temporary WAV file
+    // Write to uniquely-named temporary files to avoid races with concurrent calls
     let temp_dir = std::env::temp_dir();
-    let wav_path = temp_dir.join("parler_ifw_input.wav");
-    let json_path = temp_dir.join("parler_ifw_output.json");
+    let unique_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let wav_path = temp_dir.join(format!("parler_ifw_{}.wav", unique_id));
+    let json_path = temp_dir.join(format!("parler_ifw_{}.json", unique_id));
 
     std::fs::write(&wav_path, &wav_bytes)?;
 
@@ -50,13 +54,7 @@ pub fn transcribe_audio(samples: &[f32], model_name: &str, language: &str) -> Re
         .arg(&json_path);
 
     if language != "auto" {
-        // Normalize zh variants to "zh" for Whisper
-        let lang = if language == "zh-Hans" || language == "zh-Hant" {
-            "zh"
-        } else {
-            language
-        };
-        cmd.arg("--language").arg(lang);
+        cmd.arg("--language").arg(normalize_language(language));
     }
 
     debug!("Running insanely-fast-whisper with model: {}", model_name);
@@ -95,4 +93,12 @@ pub fn transcribe_audio(samples: &[f32], model_name: &str, language: &str) -> Re
     })?;
 
     Ok(transcript.text.unwrap_or_default().trim().to_string())
+}
+
+/// Normalize frontend language codes to the ISO 639-1 codes expected by Whisper.
+fn normalize_language(language: &str) -> &str {
+    match language {
+        "zh-Hans" | "zh-Hant" => "zh",
+        other => other,
+    }
 }
