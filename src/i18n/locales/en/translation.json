@@ -79,6 +79,10 @@
       "gemini-api": {
         "name": "Gemini API",
         "description": "Cloud-based transcription via Google Gemini. Requires API key and internet."
+      },
+      "insanely-fast-whisper": {
+        "name": "Insanely Fast Whisper",
+        "description": "GPU-accelerated Whisper via HuggingFace Transformers. Requires insanely-fast-whisper to be installed locally."
       }
     },
     "errors": {
@@ -473,6 +477,17 @@
       "modelDescription": "Select which Gemini model to use for transcription",
       "apiKeyRequired": "API Key Required",
       "apiKeyRequiredDescription": "Enter your Google Gemini API key to use cloud transcription.",
+      "save": "Save",
+      "cancel": "Cancel"
+    },
+    "insanelyFastWhisper": {
+      "title": "Insanely Fast Whisper",
+      "description": "GPU-accelerated local transcription using HuggingFace Transformers and Flash Attention.",
+      "model": "HuggingFace Model",
+      "modelDescription": "HuggingFace model identifier to use for transcription (e.g. openai/whisper-large-v3-turbo)",
+      "modelPlaceholder": "openai/whisper-large-v3-turbo",
+      "installRequired": "Installation Required",
+      "installRequiredDescription": "insanely-fast-whisper must be installed on your system. Run: pip install insanely-fast-whisper",
       "save": "Save",
       "cancel": "Cancel"
     },

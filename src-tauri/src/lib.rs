@@ -9,6 +9,7 @@ mod commands;
 mod crash_logging;
 pub mod gemini_client;
 mod helpers;
+pub mod insanely_fast_whisper_client;
 mod input;
 mod llm_client;
 mod managers;
@@ -391,6 +392,7 @@ pub fn run(cli_args: CliArgs) {
         commands::history::reprocess_history_entry,
         commands::gemini::change_gemini_api_key_setting,
         commands::gemini::change_gemini_model_setting,
+        commands::insanely_fast_whisper::change_insanely_fast_whisper_model_setting,
         helpers::clamshell::is_laptop,
     ]);
 

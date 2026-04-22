@@ -43,6 +43,7 @@ enum LoadedEngine {
     MoonshineStreaming(MoonshineStreamingEngine),
     SenseVoice(SenseVoiceEngine),
     GeminiApi,
+    InsanelyFastWhisper,
 }
 
 #[derive(Clone)]
@@ -242,7 +243,7 @@ impl TranscriptionManager {
             return Err(anyhow::anyhow!(error_msg));
         }
 
-        let model_path = if matches!(model_info.engine_type, EngineType::GeminiApi) {
+        let model_path = if matches!(model_info.engine_type, EngineType::GeminiApi | EngineType::InsanelyFastWhisper) {
             std::path::PathBuf::new()
         } else {
             self.model_manager.get_model_path(model_id)?
@@ -373,6 +374,26 @@ impl TranscriptionManager {
                     return Err(anyhow::anyhow!(error_msg));
                 }
                 LoadedEngine::GeminiApi
+            }
+            EngineType::InsanelyFastWhisper => {
+                // Check that the insanely-fast-whisper CLI is available in PATH
+                let check = std::process::Command::new("insanely-fast-whisper")
+                    .arg("--help")
+                    .output();
+                if check.is_err() {
+                    let error_msg = "insanely-fast-whisper is not installed. Install it with: pip install insanely-fast-whisper";
+                    let _ = self.app_handle.emit(
+                        "model-state-changed",
+                        ModelStateEvent {
+                            event_type: "loading_failed".to_string(),
+                            model_id: Some(model_id.to_string()),
+                            model_name: Some(model_info.name.clone()),
+                            error: Some(error_msg.to_string()),
+                        },
+                    );
+                    return Err(anyhow::anyhow!(error_msg));
+                }
+                LoadedEngine::InsanelyFastWhisper
             }
         };
 
@@ -518,6 +539,46 @@ impl TranscriptionManager {
             }
         }
 
+        // Handle InsanelyFastWhisper separately (subprocess call)
+        {
+            let engine_guard = self.lock_engine();
+            if let Some(LoadedEngine::InsanelyFastWhisper) = engine_guard.as_ref() {
+                drop(engine_guard);
+
+                let ifw_model = settings
+                    .insanely_fast_whisper_model
+                    .as_deref()
+                    .unwrap_or("openai/whisper-large-v3-turbo")
+                    .to_string();
+
+                let result = crate::insanely_fast_whisper_client::transcribe_audio(
+                    &audio,
+                    &ifw_model,
+                    &settings.selected_language,
+                )?;
+
+                let corrected = if !settings.custom_words.is_empty() {
+                    apply_custom_words(
+                        &result,
+                        &settings.custom_words,
+                        settings.word_correction_threshold,
+                    )
+                } else {
+                    result
+                };
+                let final_result = filter_transcription_output(&corrected);
+
+                let et = std::time::Instant::now();
+                info!(
+                    "InsanelyFastWhisper transcription completed in {}ms",
+                    (et - st).as_millis()
+                );
+
+                self.maybe_unload_immediately("insanely-fast-whisper transcription");
+                return Ok(final_result);
+            }
+        }
+
         // Perform transcription with the appropriate engine.
         // We use catch_unwind to prevent engine panics from poisoning the mutex,
         // which would make the app hang indefinitely on subsequent operations.
@@ -606,6 +667,9 @@ impl TranscriptionManager {
                         }
                         LoadedEngine::GeminiApi => {
                             unreachable!("GeminiApi handled before catch_unwind")
+                        }
+                        LoadedEngine::InsanelyFastWhisper => {
+                            unreachable!("InsanelyFastWhisper handled before catch_unwind")
                         }
                     }
                 },
