@@ -168,6 +168,7 @@ impl TranscriptionManager {
                     LoadedEngine::MoonshineStreaming(ref mut e) => e.unload_model(),
                     LoadedEngine::SenseVoice(ref mut e) => e.unload_model(),
                     LoadedEngine::GeminiApi => {}
+                    LoadedEngine::InsanelyFastWhisper => {}
                 }
             }
             *engine = None; // Drop the engine to free memory
