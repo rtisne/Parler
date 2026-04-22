@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod gemini;
 pub mod history;
+pub mod insanely_fast_whisper;
 pub mod models;
 pub mod transcription;
 

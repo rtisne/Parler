@@ -267,6 +267,8 @@ export const ModelsSettings: React.FC = () => {
   const [languageSearch, setLanguageSearch] = useState("");
   const [showGeminiKeyDialog, setShowGeminiKeyDialog] = useState(false);
   const [geminiKeyInput, setGeminiKeyInput] = useState("");
+  const [showIfwDialog, setShowIfwDialog] = useState(false);
+  const [ifwModelInput, setIfwModelInput] = useState("");
   const languageDropdownRef = useRef<HTMLDivElement>(null);
   const languageSearchInputRef = useRef<HTMLInputElement>(null);
   const { getSetting, updateSetting } = useSettings();
@@ -326,6 +328,11 @@ export const ModelsSettings: React.FC = () => {
   const geminiApiKey = getSetting("gemini_api_key") as string | undefined;
   const hasGeminiKey = !!geminiApiKey && geminiApiKey.length > 0;
 
+  const ifwModel = getSetting("insanely_fast_whisper_model") as
+    | string
+    | undefined
+    | null;
+
   const getModelStatus = (modelId: string): ModelCardStatus => {
     if (modelId in extractingModels) {
       return "extracting";
@@ -341,8 +348,7 @@ export const ModelsSettings: React.FC = () => {
         return "available";
       }
       return "active";
-    }
-    const model = models.find((m: ModelInfo) => m.id === modelId);
+    }    const model = models.find((m: ModelInfo) => m.id === modelId);
     if (model?.is_downloaded) {
       return "available";
     }
@@ -365,6 +371,11 @@ export const ModelsSettings: React.FC = () => {
       setShowGeminiKeyDialog(true);
       return;
     }
+    if (modelId === "insanely-fast-whisper") {
+      setIfwModelInput(ifwModel ?? "");
+      setShowIfwDialog(true);
+      return;
+    }
     setSwitchingModelId(modelId);
     try {
       await selectModel(modelId);
@@ -381,6 +392,18 @@ export const ModelsSettings: React.FC = () => {
     setSwitchingModelId("gemini-api");
     try {
       await selectModel("gemini-api");
+    } finally {
+      setSwitchingModelId(null);
+    }
+  };
+
+  const handleIfwSave = async () => {
+    const model = ifwModelInput.trim();
+    await commands.changeInsanelyFastWhisperModelSetting(model);
+    setShowIfwDialog(false);
+    setSwitchingModelId("insanely-fast-whisper");
+    try {
+      await selectModel("insanely-fast-whisper");
     } finally {
       setSwitchingModelId(null);
     }
@@ -699,6 +722,67 @@ export const ModelsSettings: React.FC = () => {
                 disabled={!geminiKeyInput.trim()}
               >
                 {t("settings.gemini.save")}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showIfwDialog && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+          onClick={() => setShowIfwDialog(false)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape") setShowIfwDialog(false);
+          }}
+        >
+          <div
+            className="bg-background border border-mid-gray/40 rounded-xl p-5 w-96 shadow-2xl space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div>
+              <h3 className="text-base font-semibold">
+                {t("settings.insanelyFastWhisper.installRequired")}
+              </h3>
+              <p className="text-sm text-text/60 mt-1">
+                {t("settings.insanelyFastWhisper.installRequiredDescription")}
+              </p>
+            </div>
+            <div>
+              <label className="text-sm font-medium">
+                {t("settings.insanelyFastWhisper.model")}
+              </label>
+              <p className="text-xs text-text/50 mb-1">
+                {t("settings.insanelyFastWhisper.modelDescription")}
+              </p>
+              <Input
+                autoFocus
+                type="text"
+                value={ifwModelInput}
+                onChange={(e) => setIfwModelInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleIfwSave();
+                }}
+                placeholder={t(
+                  "settings.insanelyFastWhisper.modelPlaceholder",
+                )}
+                className="w-full"
+              />
+            </div>
+            <div className="flex justify-end gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setShowIfwDialog(false)}
+              >
+                {t("settings.insanelyFastWhisper.cancel")}
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={handleIfwSave}
+              >
+                {t("settings.insanelyFastWhisper.save")}
               </Button>
             </div>
           </div>

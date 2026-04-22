@@ -388,6 +388,8 @@ pub struct AppSettings {
     #[serde(default = "default_gemini_model")]
     pub gemini_model: String,
     #[serde(default)]
+    pub insanely_fast_whisper_model: Option<String>,
+    #[serde(default)]
     pub post_process_actions: Vec<PostProcessAction>,
     #[serde(default)]
     pub saved_processing_models: Vec<SavedProcessingModel>,

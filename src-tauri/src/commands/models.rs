@@ -121,7 +121,7 @@ pub async fn has_any_models_available(
     let models = model_manager.get_available_models();
     Ok(models
         .iter()
-        .any(|m| m.is_downloaded && !matches!(m.engine_type, EngineType::GeminiApi)))
+        .any(|m| m.is_downloaded && !matches!(m.engine_type, EngineType::GeminiApi | EngineType::InsanelyFastWhisper)))
 }
 
 #[tauri::command]
@@ -131,7 +131,7 @@ pub async fn has_any_models_or_downloads(
 ) -> Result<bool, String> {
     let models = model_manager.get_available_models();
     Ok(models.iter().any(|m| {
-        !matches!(m.engine_type, EngineType::GeminiApi) && (m.is_downloaded || m.is_downloading)
+        !matches!(m.engine_type, EngineType::GeminiApi | EngineType::InsanelyFastWhisper) && (m.is_downloaded || m.is_downloading)
     }))
 }
 
