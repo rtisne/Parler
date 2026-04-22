@@ -339,7 +339,7 @@ jobs:
         shell: bash
         run: |
           echo "⚠️ Disabling createUpdaterArtifacts (no signing key available)"
-          node -e 'var fs=require("fs"),c=JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json","utf8"));c.bundle.createUpdaterArtifacts=false;fs.writeFileSync("src-tauri/tauri.conf.json",JSON.stringify(c,null,2)+"\n");console.log("createUpdaterArtifacts disabled");'
+          node -e 'var fs=require("fs"),c=JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json","utf8"));if(!c.bundle)c.bundle={};c.bundle.createUpdaterArtifacts=false;fs.writeFileSync("src-tauri/tauri.conf.json",JSON.stringify(c,null,2)+"\n");console.log("createUpdaterArtifacts disabled");'
 
       - name: Build with Tauri
         if: inputs.apple_signing
