@@ -1,61 +1,61 @@
-# Optimisations de performance pour CPU
+# CPU Performance Optimizations
 
-Ce document décrit les optimisations implémentées pour améliorer les performances de transcription sur les PC sans carte graphique dédiée (PC d'entreprise typiques).
+This document describes the optimizations implemented to improve transcription performance on PCs without a dedicated graphics card (typical business PCs).
 
-## Vue d'ensemble
+## Overview
 
-Le système détecte automatiquement les capacités matérielles au démarrage et configure les paramètres optimaux pour votre machine. Les utilisateurs avec GPU continuent d'avoir d'excellentes performances, tandis que les utilisateurs CPU-only bénéficient maintenant d'optimisations spécifiques.
+The system automatically detects hardware capabilities at startup and configures the optimal settings for your machine. Users with a GPU continue to get excellent performance, while CPU-only users now benefit from specific optimizations.
 
-## Détection automatique
+## Automatic detection
 
-### Détection GPU
+### GPU detection
 
-Le système détecte la présence d'un GPU compatible :
+The system detects the presence of a compatible GPU:
 
-- **Windows** : Détection NVIDIA via `nvidia-smi`
-- **Linux** : Détection NVIDIA via `/proc/driver/nvidia` et AMD via `/sys/class/drm`
-- **macOS** : Détection Metal (tous les Macs modernes M1/M2/M3)
+- **Windows**: NVIDIA detection via `nvidia-smi`
+- **Linux**: NVIDIA detection via `/proc/driver/nvidia` and AMD via `/sys/class/drm`
+- **macOS**: Metal detection (all modern M1/M2/M3 Macs)
 
-### Configuration des threads CPU
+### CPU thread configuration
 
-Le nombre optimal de threads est calculé automatiquement :
+The optimal number of threads is calculated automatically:
 
-- **Avec GPU** : 50% des cœurs CPU (min 2) - le GPU fait le gros du travail
-- **Sans GPU** : 75% des cœurs CPU (min 2, max 8) - utilisation intensive du CPU
+- **With GPU**: 50% of CPU cores (min 2) - the GPU handles most of the work
+- **Without GPU**: 75% of CPU cores (min 2, max 8) - intensive CPU usage
 
-## Optimisations implémentées
+## Implemented optimizations
 
-### 1. Configuration threads CPU pour Whisper
+### 1. CPU thread configuration for Whisper
 
-Les modèles Whisper sont maintenant configurés avec le paramètre `n_threads` optimal basé sur votre matériel. Cela permet d'utiliser efficacement tous les cœurs CPU disponibles.
+Whisper models are now configured with the optimal `n_threads` parameter based on your hardware. This allows efficient use of all available CPU cores.
 
-**Impact** : Amélioration de 40-60% des performances sur CPU multi-cœurs.
+**Impact**: 40-60% performance improvement on multi-core CPUs.
 
-### 2. Modèles recommandés intelligents
+### 2. Smart recommended models
 
-Le système recommande automatiquement le meilleur modèle selon votre matériel :
+The system automatically recommends the best model based on your hardware:
 
-#### Avec GPU
-- **Recommandé** : Whisper Turbo (1.6 GB)
-- Meilleure qualité de transcription
-- Vitesse excellente grâce à l'accélération GPU
+#### With GPU
+- **Recommended**: Whisper Turbo (1.6 GB)
+- Best transcription quality
+- Excellent speed thanks to GPU acceleration
 
-#### Sans GPU (CPU-only)
-- **Recommandé** : Parakeet V3 INT8 (478 MB)
-- 3-5x plus rapide que Whisper sur CPU
-- Qualité comparable à Whisper Medium
-- Supporte 25 langues européennes
+#### Without GPU (CPU-only)
+- **Recommended**: Parakeet V3 INT8 (478 MB)
+- 3-5x faster than Whisper on CPU
+- Quality comparable to Whisper Medium
+- Supports 25 European languages
 
-### 3. Nouveaux modèles Whisper Q4 optimisés CPU
+### 3. New CPU-optimized Whisper Q4 models
 
-Deux nouveaux modèles ont été ajoutés pour les utilisateurs CPU qui préfèrent Whisper :
+Two new models have been added for CPU users who prefer Whisper:
 
-| Modèle | Taille | Speed Score | Qualité | Gain de vitesse |
-|--------|--------|-------------|---------|-----------------|
-| Whisper Small Q4 | 140 MB | 0.95 | Bonne | +30% vs Small standard |
-| Whisper Medium Q4 | 280 MB | 0.80 | Très bonne | +25% vs Medium standard |
+| Model | Size | Speed Score | Quality | Speed gain |
+|-------|------|-------------|---------|------------|
+| Whisper Small Q4 | 140 MB | 0.95 | Good | +30% vs standard Small |
+| Whisper Medium Q4 | 280 MB | 0.80 | Very good | +25% vs standard Medium |
 
-Ces modèles utilisent la quantification Q4_0 (plus agressive que Q4_1) pour des performances maximales sur CPU.
+These models use Q4_0 quantization (more aggressive than Q4_1) for maximum CPU performance.
 
 ### 4. Gestion intelligente de la mémoire
 
