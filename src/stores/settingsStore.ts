@@ -142,6 +142,10 @@ const settingUpdaters: {
   gemini_api_key: (value) =>
     commands.changeGeminiApiKeySetting((value as string | null) ?? ""),
   gemini_model: (value) => commands.changeGeminiModelSetting(value as string),
+  cpu_threads: (value) =>
+    commands.changeCpuThreadsSetting(value as number),
+  preload_model_on_startup: (value) =>
+    commands.changePreloadModelSetting(value as boolean),
 };
 
 export const useSettingsStore = create<SettingsStore>()(

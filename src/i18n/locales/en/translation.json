@@ -272,6 +272,7 @@
         "app": "App",
         "output": "Output",
         "transcription": "Transcription",
+        "performance": "Performance",
         "history": "History",
         "experimental": "Experimental",
         "cloudModels": "Cloud Models"
@@ -366,6 +367,20 @@
         "add": "Add",
         "remove": "Remove {{word}}",
         "duplicate": "\"{{word}}\" already exists"
+      },
+      "cpuThreads": {
+        "title": "CPU Threads",
+        "description": "Number of CPU threads to use for transcription. Recommended: {{recommended}} threads for your system. Model will reload on change.",
+        "threads": "threads"
+      },
+      "preloadModel": {
+        "label": "Preload Model on Startup",
+        "description": "Load the transcription model immediately when the app starts for faster first transcription."
+      },
+      "hardware": {
+        "gpu": "GPU Detected",
+        "cpu": "CPU Only",
+        "cores": "{{count}} cores"
       }
     },
     "postProcessing": {
