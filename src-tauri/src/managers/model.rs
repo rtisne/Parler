@@ -1,3 +1,4 @@
+use crate::hardware_detection::get_hardware_capabilities;
 use crate::settings::{get_settings, write_settings};
 use anyhow::Result;
 use flate2::read::GzDecoder;
@@ -119,6 +120,30 @@ impl ModelManager {
             },
         );
 
+        // Add faster q4_0 variant of small model for CPU-only systems
+        available_models.insert(
+            "small-q4_0".to_string(),
+            ModelInfo {
+                id: "small-q4_0".to_string(),
+                name: "Whisper Small Q4".to_string(),
+                description: "Very fast on CPU, slightly lower quality.".to_string(),
+                filename: "ggml-small-q4_0.bin".to_string(),
+                url: Some("https://blob.handy.computer/ggml-small-q4_0.bin".to_string()),
+                size_mb: 140, // q4_0 is much smaller
+                is_downloaded: false,
+                is_downloading: false,
+                partial_size: 0,
+                is_directory: false,
+                engine_type: EngineType::Whisper,
+                accuracy_score: 0.55,
+                speed_score: 0.92,
+                supports_translation: true,
+                is_recommended: false,
+                supported_languages: whisper_languages.clone(),
+                is_custom: false,
+            },
+        );
+
         // Add downloadable models
         available_models.insert(
             "medium".to_string(),
@@ -143,6 +168,30 @@ impl ModelManager {
             },
         );
 
+        // Add faster q4_0 variant of medium model for CPU-only systems
+        available_models.insert(
+            "medium-q4_0".to_string(),
+            ModelInfo {
+                id: "medium-q4_0".to_string(),
+                name: "Whisper Medium Q4".to_string(),
+                description: "Fast on CPU with good accuracy.".to_string(),
+                filename: "whisper-medium-q4_0.bin".to_string(),
+                url: Some("https://blob.handy.computer/whisper-medium-q4_0.bin".to_string()),
+                size_mb: 280, // q4_0 is smaller than q4_1
+                is_downloaded: false,
+                is_downloading: false,
+                partial_size: 0,
+                is_directory: false,
+                engine_type: EngineType::Whisper,
+                accuracy_score: 0.72,
+                speed_score: 0.75,
+                supports_translation: true,
+                is_recommended: false,
+                supported_languages: whisper_languages.clone(),
+                is_custom: false,
+            },
+        );
+
         available_models.insert(
             "turbo".to_string(),
             ModelInfo {
@@ -160,7 +209,7 @@ impl ModelManager {
                 accuracy_score: 0.80,
                 speed_score: 0.40,
                 supports_translation: false, // Turbo doesn't support translation
-                is_recommended: true,
+                is_recommended: false,       // Will be set based on GPU detection
                 supported_languages: whisper_languages.clone(),
                 is_custom: false,
             },
@@ -264,7 +313,7 @@ impl ModelManager {
                 accuracy_score: 0.80,
                 speed_score: 0.85,
                 supports_translation: false,
-                is_recommended: true,
+                is_recommended: false, // Will be set based on GPU detection
                 supported_languages: parakeet_v3_languages,
                 is_custom: false,
             },
@@ -452,6 +501,9 @@ impl ModelManager {
             warn!("Failed to discover custom models: {}", e);
         }
 
+        // Configure model recommendations based on hardware capabilities
+        Self::configure_recommendations_for_hardware(&mut available_models);
+
         let manager = Self {
             app_handle: app_handle.clone(),
             models_dir,
@@ -466,10 +518,80 @@ impl ModelManager {
         // Check which models are already downloaded
         manager.update_download_status()?;
 
+        // Initialize CPU threads setting based on hardware detection
+        manager.initialize_hardware_settings()?;
+
         // Auto-select a model if none is currently selected
         manager.auto_select_model_if_needed()?;
 
         Ok(manager)
+    }
+
+    /// Configure model recommendations based on hardware capabilities
+    fn configure_recommendations_for_hardware(models: &mut HashMap<String, ModelInfo>) {
+        let hw = get_hardware_capabilities();
+
+        if hw.has_gpu {
+            // With GPU: recommend Whisper Turbo for best quality
+            if let Some(turbo) = models.get_mut("turbo") {
+                turbo.is_recommended = true;
+                info!("GPU detected: recommending Whisper Turbo");
+            }
+        } else {
+            // Without GPU: recommend Parakeet V3 for best CPU performance
+            // Also mark fast Whisper models (q4_0) as good alternatives
+            if let Some(parakeet) = models.get_mut("parakeet-tdt-0.6b-v3") {
+                parakeet.is_recommended = true;
+                info!("CPU-only detected: recommending Parakeet V3");
+            }
+
+            // Boost speed scores for q4_0 models on CPU-only systems
+            if let Some(small_q4) = models.get_mut("small-q4_0") {
+                small_q4.speed_score = 0.95; // Even faster on CPU-only
+            }
+            if let Some(medium_q4) = models.get_mut("medium-q4_0") {
+                medium_q4.speed_score = 0.80; // Faster on CPU-only
+            }
+        }
+    }
+
+    /// Initialize hardware-related settings (CPU threads, preload, timeout)
+    fn initialize_hardware_settings(&self) -> Result<()> {
+        let hw = get_hardware_capabilities();
+        let mut settings = get_settings(&self.app_handle);
+        let mut changed = false;
+
+        // Set CPU threads if not already configured
+        if settings.cpu_threads == 4 {
+            // Still at default value, update it
+            let max_supported_threads = hw.cpu_cores.min(16).max(1);
+            let recommended_threads = hw.recommended_threads.clamp(1, max_supported_threads);
+            settings.cpu_threads = recommended_threads;
+            changed = true;
+            info!("Initialized CPU threads to {}", recommended_threads);
+        }
+
+        // For CPU-only systems, adjust model unload timeout
+        if !hw.has_gpu
+            && settings.model_unload_timeout == crate::settings::ModelUnloadTimeout::Immediately
+        {
+            settings.model_unload_timeout = crate::settings::ModelUnloadTimeout::Min5;
+            changed = true;
+            info!("CPU-only mode: adjusted model unload timeout to 5 minutes");
+        }
+
+        // Enable preload on startup for better experience
+        if !settings.preload_model_on_startup {
+            settings.preload_model_on_startup = true;
+            changed = true;
+            info!("Enabled model preload on startup");
+        }
+
+        if changed {
+            write_settings(&self.app_handle, settings);
+        }
+
+        Ok(())
     }
 
     pub fn get_available_models(&self) -> Vec<ModelInfo> {

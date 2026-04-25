@@ -28,3 +28,6 @@ export { HistoryLimit } from "./HistoryLimit";
 export { RecordingRetentionPeriodSelector } from "./RecordingRetentionPeriod";
 export { AutostartToggle } from "./AutostartToggle";
 export { UpdateChecksToggle } from "./UpdateChecksToggle";
+export { CpuThreadsSlider } from "./CpuThreadsSlider";
+export { PreloadModel } from "./PreloadModel";
+export { HardwareInfo } from "./HardwareInfo";

@@ -1314,3 +1314,29 @@ pub fn change_long_audio_threshold_setting(app: AppHandle, threshold: f32) -> Re
     settings::write_settings(&app, settings);
     Ok(())
 }
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_cpu_threads_setting(app: AppHandle, threads: usize) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    // Validate thread count (minimum 1, maximum 16)
+    let validated_threads = threads.max(1).min(16);
+    settings.cpu_threads = validated_threads;
+    settings::write_settings(&app, settings);
+
+    // Note: Model will need to be reloaded for this to take effect
+    info!(
+        "CPU threads setting changed to {}. Model needs to be reloaded for this to take effect.",
+        validated_threads
+    );
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub fn change_preload_model_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let mut settings = settings::get_settings(&app);
+    settings.preload_model_on_startup = enabled;
+    settings::write_settings(&app, settings);
+    Ok(())
+}
