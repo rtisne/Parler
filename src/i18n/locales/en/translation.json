@@ -32,9 +32,17 @@
         "name": "Whisper Small",
         "description": "Fast and fairly accurate."
       },
+      "small-q4_0": {
+        "name": "Whisper Small Q4",
+        "description": "Faster on CPU. Quantized for better performance."
+      },
       "medium": {
         "name": "Whisper Medium",
         "description": "Good accuracy, medium speed"
+      },
+      "medium-q4_0": {
+        "name": "Whisper Medium Q4",
+        "description": "Better CPU performance. Quantized for efficiency."
       },
       "turbo": {
         "name": "Whisper Turbo",
