@@ -564,9 +564,11 @@ impl ModelManager {
         // Set CPU threads if not already configured
         if settings.cpu_threads == 4 {
             // Still at default value, update it
-            settings.cpu_threads = hw.recommended_threads;
+            let max_supported_threads = hw.cpu_cores.min(16).max(1);
+            let recommended_threads = hw.recommended_threads.clamp(1, max_supported_threads);
+            settings.cpu_threads = recommended_threads;
             changed = true;
-            info!("Initialized CPU threads to {}", hw.recommended_threads);
+            info!("Initialized CPU threads to {}", recommended_threads);
         }
 
         // For CPU-only systems, adjust model unload timeout
