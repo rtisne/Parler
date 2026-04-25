@@ -120,6 +120,30 @@ impl ModelManager {
             },
         );
 
+        // Add faster q4_0 variant of small model for CPU-only systems
+        available_models.insert(
+            "small-q4_0".to_string(),
+            ModelInfo {
+                id: "small-q4_0".to_string(),
+                name: "Whisper Small Q4".to_string(),
+                description: "Very fast on CPU, slightly lower quality.".to_string(),
+                filename: "ggml-small-q4_0.bin".to_string(),
+                url: Some("https://blob.handy.computer/ggml-small-q4_0.bin".to_string()),
+                size_mb: 140, // q4_0 is much smaller
+                is_downloaded: false,
+                is_downloading: false,
+                partial_size: 0,
+                is_directory: false,
+                engine_type: EngineType::Whisper,
+                accuracy_score: 0.55,
+                speed_score: 0.92,
+                supports_translation: true,
+                is_recommended: false,
+                supported_languages: whisper_languages.clone(),
+                is_custom: false,
+            },
+        );
+
         // Add downloadable models
         available_models.insert(
             "medium".to_string(),
@@ -144,6 +168,30 @@ impl ModelManager {
             },
         );
 
+        // Add faster q4_0 variant of medium model for CPU-only systems
+        available_models.insert(
+            "medium-q4_0".to_string(),
+            ModelInfo {
+                id: "medium-q4_0".to_string(),
+                name: "Whisper Medium Q4".to_string(),
+                description: "Fast on CPU with good accuracy.".to_string(),
+                filename: "whisper-medium-q4_0.bin".to_string(),
+                url: Some("https://blob.handy.computer/whisper-medium-q4_0.bin".to_string()),
+                size_mb: 280, // q4_0 is smaller than q4_1
+                is_downloaded: false,
+                is_downloading: false,
+                partial_size: 0,
+                is_directory: false,
+                engine_type: EngineType::Whisper,
+                accuracy_score: 0.72,
+                speed_score: 0.75,
+                supports_translation: true,
+                is_recommended: false,
+                supported_languages: whisper_languages.clone(),
+                is_custom: false,
+            },
+        );
+
         available_models.insert(
             "turbo".to_string(),
             ModelInfo {
@@ -161,7 +209,7 @@ impl ModelManager {
                 accuracy_score: 0.80,
                 speed_score: 0.40,
                 supports_translation: false, // Turbo doesn't support translation
-                is_recommended: false, // Will be set based on GPU detection
+                is_recommended: false,       // Will be set based on GPU detection
                 supported_languages: whisper_languages.clone(),
                 is_custom: false,
             },
@@ -491,9 +539,18 @@ impl ModelManager {
             }
         } else {
             // Without GPU: recommend Parakeet V3 for best CPU performance
+            // Also mark fast Whisper models (q4_0) as good alternatives
             if let Some(parakeet) = models.get_mut("parakeet-tdt-0.6b-v3") {
                 parakeet.is_recommended = true;
                 info!("CPU-only detected: recommending Parakeet V3");
+            }
+
+            // Boost speed scores for q4_0 models on CPU-only systems
+            if let Some(small_q4) = models.get_mut("small-q4_0") {
+                small_q4.speed_score = 0.95; // Even faster on CPU-only
+            }
+            if let Some(medium_q4) = models.get_mut("medium-q4_0") {
+                medium_q4.speed_score = 0.80; // Faster on CPU-only
             }
         }
     }
@@ -513,7 +570,9 @@ impl ModelManager {
         }
 
         // For CPU-only systems, adjust model unload timeout
-        if !hw.has_gpu && settings.model_unload_timeout == crate::settings::ModelUnloadTimeout::Immediately {
+        if !hw.has_gpu
+            && settings.model_unload_timeout == crate::settings::ModelUnloadTimeout::Immediately
+        {
             settings.model_unload_timeout = crate::settings::ModelUnloadTimeout::Min5;
             changed = true;
             info!("CPU-only mode: adjusted model unload timeout to 5 minutes");

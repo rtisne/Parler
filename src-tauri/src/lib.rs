@@ -340,6 +340,8 @@ pub fn run(cli_args: CliArgs) {
         shortcut::change_show_tray_icon_setting,
         shortcut::change_long_audio_model_setting,
         shortcut::change_long_audio_threshold_setting,
+        shortcut::change_cpu_threads_setting,
+        shortcut::change_preload_model_setting,
         shortcut::handy_keys::start_handy_keys_recording,
         shortcut::handy_keys::stop_handy_keys_recording,
         trigger_update_check,

@@ -276,19 +276,21 @@ impl TranscriptionManager {
                     ..Default::default()
                 };
 
-                engine.load_model_with_params(&model_path, model_params).map_err(|e| {
-                    let error_msg = format!("Failed to load whisper model {}: {}", model_id, e);
-                    let _ = self.app_handle.emit(
-                        "model-state-changed",
-                        ModelStateEvent {
-                            event_type: "loading_failed".to_string(),
-                            model_id: Some(model_id.to_string()),
-                            model_name: Some(model_info.name.clone()),
-                            error: Some(error_msg.clone()),
-                        },
-                    );
-                    anyhow::anyhow!(error_msg)
-                })?;
+                engine
+                    .load_model_with_params(&model_path, model_params)
+                    .map_err(|e| {
+                        let error_msg = format!("Failed to load whisper model {}: {}", model_id, e);
+                        let _ = self.app_handle.emit(
+                            "model-state-changed",
+                            ModelStateEvent {
+                                event_type: "loading_failed".to_string(),
+                                model_id: Some(model_id.to_string()),
+                                model_name: Some(model_info.name.clone()),
+                                error: Some(error_msg.clone()),
+                            },
+                        );
+                        anyhow::anyhow!(error_msg)
+                    })?;
 
                 info!("Loaded Whisper model with {} threads", settings.cpu_threads);
                 LoadedEngine::Whisper(engine)
