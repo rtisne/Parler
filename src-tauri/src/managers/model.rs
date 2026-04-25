@@ -1,3 +1,4 @@
+use crate::hardware_detection::get_hardware_capabilities;
 use crate::settings::{get_settings, write_settings};
 use anyhow::Result;
 use flate2::read::GzDecoder;
@@ -160,7 +161,7 @@ impl ModelManager {
                 accuracy_score: 0.80,
                 speed_score: 0.40,
                 supports_translation: false, // Turbo doesn't support translation
-                is_recommended: true,
+                is_recommended: false, // Will be set based on GPU detection
                 supported_languages: whisper_languages.clone(),
                 is_custom: false,
             },
@@ -264,7 +265,7 @@ impl ModelManager {
                 accuracy_score: 0.80,
                 speed_score: 0.85,
                 supports_translation: false,
-                is_recommended: true,
+                is_recommended: false, // Will be set based on GPU detection
                 supported_languages: parakeet_v3_languages,
                 is_custom: false,
             },
@@ -452,6 +453,9 @@ impl ModelManager {
             warn!("Failed to discover custom models: {}", e);
         }
 
+        // Configure model recommendations based on hardware capabilities
+        Self::configure_recommendations_for_hardware(&mut available_models);
+
         let manager = Self {
             app_handle: app_handle.clone(),
             models_dir,
@@ -466,10 +470,67 @@ impl ModelManager {
         // Check which models are already downloaded
         manager.update_download_status()?;
 
+        // Initialize CPU threads setting based on hardware detection
+        manager.initialize_hardware_settings()?;
+
         // Auto-select a model if none is currently selected
         manager.auto_select_model_if_needed()?;
 
         Ok(manager)
+    }
+
+    /// Configure model recommendations based on hardware capabilities
+    fn configure_recommendations_for_hardware(models: &mut HashMap<String, ModelInfo>) {
+        let hw = get_hardware_capabilities();
+
+        if hw.has_gpu {
+            // With GPU: recommend Whisper Turbo for best quality
+            if let Some(turbo) = models.get_mut("turbo") {
+                turbo.is_recommended = true;
+                info!("GPU detected: recommending Whisper Turbo");
+            }
+        } else {
+            // Without GPU: recommend Parakeet V3 for best CPU performance
+            if let Some(parakeet) = models.get_mut("parakeet-tdt-0.6b-v3") {
+                parakeet.is_recommended = true;
+                info!("CPU-only detected: recommending Parakeet V3");
+            }
+        }
+    }
+
+    /// Initialize hardware-related settings (CPU threads, preload, timeout)
+    fn initialize_hardware_settings(&self) -> Result<()> {
+        let hw = get_hardware_capabilities();
+        let mut settings = get_settings(&self.app_handle);
+        let mut changed = false;
+
+        // Set CPU threads if not already configured
+        if settings.cpu_threads == 4 {
+            // Still at default value, update it
+            settings.cpu_threads = hw.recommended_threads;
+            changed = true;
+            info!("Initialized CPU threads to {}", hw.recommended_threads);
+        }
+
+        // For CPU-only systems, adjust model unload timeout
+        if !hw.has_gpu && settings.model_unload_timeout == crate::settings::ModelUnloadTimeout::Immediately {
+            settings.model_unload_timeout = crate::settings::ModelUnloadTimeout::Min5;
+            changed = true;
+            info!("CPU-only mode: adjusted model unload timeout to 5 minutes");
+        }
+
+        // Enable preload on startup for better experience
+        if !settings.preload_model_on_startup {
+            settings.preload_model_on_startup = true;
+            changed = true;
+            info!("Enabled model preload on startup");
+        }
+
+        if changed {
+            write_settings(&self.app_handle, settings);
+        }
+
+        Ok(())
     }
 
     pub fn get_available_models(&self) -> Vec<ModelInfo> {

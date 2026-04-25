@@ -393,6 +393,10 @@ pub struct AppSettings {
     pub post_process_actions: Vec<PostProcessAction>,
     #[serde(default)]
     pub saved_processing_models: Vec<SavedProcessingModel>,
+    #[serde(default = "default_cpu_threads")]
+    pub cpu_threads: usize,
+    #[serde(default = "default_preload_model")]
+    pub preload_model_on_startup: bool,
 }
 
 fn default_model() -> String {
@@ -620,6 +624,15 @@ fn default_gemini_model() -> String {
     "gemini-2.5-flash".to_string()
 }
 
+fn default_cpu_threads() -> usize {
+    // Will be overridden by hardware detection
+    4
+}
+
+fn default_preload_model() -> bool {
+    false
+}
+
 fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
     let mut changed = false;
     for provider in default_post_process_providers() {
@@ -811,6 +824,8 @@ pub fn get_default_settings() -> AppSettings {
         insanely_fast_whisper_model: None,
         post_process_actions: Vec::new(),
         saved_processing_models: Vec::new(),
+        cpu_threads: default_cpu_threads(),
+        preload_model_on_startup: default_preload_model(),
     }
 }
 

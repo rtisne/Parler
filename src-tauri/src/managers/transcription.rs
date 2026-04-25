@@ -1,4 +1,5 @@
 use crate::audio_toolkit::{apply_custom_words, filter_transcription_output};
+use crate::hardware_detection::get_hardware_capabilities;
 use crate::managers::model::{EngineType, ModelManager};
 use crate::settings::{get_settings, ModelUnloadTimeout};
 use anyhow::Result;
@@ -23,7 +24,7 @@ use transcribe_rs::{
             Language as SenseVoiceLanguage, SenseVoiceEngine, SenseVoiceInferenceParams,
             SenseVoiceModelParams,
         },
-        whisper::{WhisperEngine, WhisperInferenceParams},
+        whisper::{WhisperEngine, WhisperInferenceParams, WhisperModelParams},
     },
     TranscriptionEngine,
 };
@@ -136,6 +137,16 @@ impl TranscriptionManager {
                 debug!("Idle watcher thread shutting down gracefully");
             });
             *manager.watcher_handle.lock().unwrap() = Some(handle);
+        }
+
+        // Preload model if enabled in settings
+        let settings = get_settings(&app_handle);
+        if settings.preload_model_on_startup && !settings.selected_model.is_empty() {
+            info!("Preloading model on startup: {}", settings.selected_model);
+            let manager_clone = manager.clone();
+            thread::spawn(move || {
+                manager_clone.initiate_model_load();
+            });
         }
 
         Ok(manager)
@@ -257,7 +268,15 @@ impl TranscriptionManager {
         let loaded_engine = match model_info.engine_type {
             EngineType::Whisper => {
                 let mut engine = WhisperEngine::new();
-                engine.load_model(&model_path).map_err(|e| {
+
+                // Configure CPU threads for optimal performance
+                let settings = get_settings(&self.app_handle);
+                let model_params = WhisperModelParams {
+                    n_threads: settings.cpu_threads as i32,
+                    ..Default::default()
+                };
+
+                engine.load_model_with_params(&model_path, model_params).map_err(|e| {
                     let error_msg = format!("Failed to load whisper model {}: {}", model_id, e);
                     let _ = self.app_handle.emit(
                         "model-state-changed",
@@ -270,6 +289,8 @@ impl TranscriptionManager {
                     );
                     anyhow::anyhow!(error_msg)
                 })?;
+
+                info!("Loaded Whisper model with {} threads", settings.cpu_threads);
                 LoadedEngine::Whisper(engine)
             }
             EngineType::Parakeet => {

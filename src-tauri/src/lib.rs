@@ -8,6 +8,7 @@ mod clipboard;
 mod commands;
 mod crash_logging;
 pub mod gemini_client;
+mod hardware_detection;
 mod helpers;
 mod input;
 pub mod insanely_fast_whisper_client;
@@ -394,6 +395,7 @@ pub fn run(cli_args: CliArgs) {
         commands::gemini::change_gemini_api_key_setting,
         commands::gemini::change_gemini_model_setting,
         commands::insanely_fast_whisper::change_insanely_fast_whisper_model_setting,
+        commands::hardware::get_hardware_info,
         helpers::clamshell::is_laptop,
     ]);
 
