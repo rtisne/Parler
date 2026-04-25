@@ -143,10 +143,7 @@ impl TranscriptionManager {
         let settings = get_settings(&app_handle);
         if settings.preload_model_on_startup && !settings.selected_model.is_empty() {
             info!("Preloading model on startup: {}", settings.selected_model);
-            let manager_clone = manager.clone();
-            thread::spawn(move || {
-                manager_clone.initiate_model_load();
-            });
+            manager.initiate_model_load();
         }
 
         Ok(manager)
