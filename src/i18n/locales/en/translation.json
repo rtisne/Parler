@@ -378,7 +378,7 @@
       },
       "cpuThreads": {
         "title": "CPU Threads",
-        "description": "Number of CPU threads to use for transcription. Recommended: {{recommended}} threads for your system. Model will reload on change.",
+        "description": "Number of CPU threads to use for transcription. Recommended: {{recommended}} threads for your system.",
         "threads": "threads"
       },
       "preloadModel": {
