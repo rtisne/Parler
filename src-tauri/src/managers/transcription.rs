@@ -266,15 +266,8 @@ impl TranscriptionManager {
             EngineType::Whisper => {
                 let mut engine = WhisperEngine::new();
 
-                // Configure CPU threads for optimal performance
-                let settings = get_settings(&self.app_handle);
-                let model_params = WhisperModelParams {
-                    n_threads: settings.cpu_threads as i32,
-                    ..Default::default()
-                };
-
                 engine
-                    .load_model_with_params(&model_path, model_params)
+                    .load_model_with_params(&model_path, WhisperModelParams::default())
                     .map_err(|e| {
                         let error_msg = format!("Failed to load whisper model {}: {}", model_id, e);
                         let _ = self.app_handle.emit(
@@ -289,7 +282,7 @@ impl TranscriptionManager {
                         anyhow::anyhow!(error_msg)
                     })?;
 
-                info!("Loaded Whisper model with {} threads", settings.cpu_threads);
+                info!("Loaded Whisper model");
                 LoadedEngine::Whisper(engine)
             }
             EngineType::Parakeet => {
