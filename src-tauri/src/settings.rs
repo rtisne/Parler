@@ -295,7 +295,10 @@ impl Default for TypingTool {
 }
 
 /* still handy for composing the initial JSON in the store ------------- */
-#[derive(Serialize, Deserialize, Debug, Clone, Type)]
+// NOTE: `Debug` is intentionally NOT derived here. Provider credentials
+// (`gemini_api_key`, `post_process_api_keys`) must never appear in logs or any
+// `{:?}` output. A sanitized `Debug` implementation is provided below instead.
+#[derive(Serialize, Deserialize, Clone, Type)]
 pub struct AppSettings {
     pub bindings: HashMap<String, ShortcutBinding>,
     pub push_to_talk: bool,
@@ -397,6 +400,91 @@ pub struct AppSettings {
     pub cpu_threads: usize,
     #[serde(default = "default_preload_model")]
     pub preload_model_on_startup: bool,
+}
+
+impl std::fmt::Debug for AppSettings {
+    /// Sanitized `Debug` output that never exposes provider credentials.
+    ///
+    /// `gemini_api_key` and the values of `post_process_api_keys` are replaced
+    /// with `[REDACTED]` so that logging an `AppSettings` (e.g. via `{:?}`)
+    /// cannot leak secrets. Provider ids in `post_process_api_keys` are not
+    /// secret and are preserved for debugging.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const REDACTED: &str = "[REDACTED]";
+        let gemini_api_key = self.gemini_api_key.as_ref().map(|_| REDACTED);
+        let post_process_api_keys: std::collections::BTreeMap<&String, &str> = self
+            .post_process_api_keys
+            .keys()
+            .map(|id| (id, REDACTED))
+            .collect();
+
+        f.debug_struct("AppSettings")
+            .field("bindings", &self.bindings)
+            .field("push_to_talk", &self.push_to_talk)
+            .field("audio_feedback", &self.audio_feedback)
+            .field("audio_feedback_volume", &self.audio_feedback_volume)
+            .field("sound_theme", &self.sound_theme)
+            .field("start_hidden", &self.start_hidden)
+            .field("autostart_enabled", &self.autostart_enabled)
+            .field("update_checks_enabled", &self.update_checks_enabled)
+            .field("selected_model", &self.selected_model)
+            .field("always_on_microphone", &self.always_on_microphone)
+            .field("selected_microphone", &self.selected_microphone)
+            .field("clamshell_microphone", &self.clamshell_microphone)
+            .field("selected_output_device", &self.selected_output_device)
+            .field("translate_to_english", &self.translate_to_english)
+            .field("selected_language", &self.selected_language)
+            .field("overlay_position", &self.overlay_position)
+            .field("debug_mode", &self.debug_mode)
+            .field("log_level", &self.log_level)
+            .field("custom_words", &self.custom_words)
+            .field("model_unload_timeout", &self.model_unload_timeout)
+            .field("word_correction_threshold", &self.word_correction_threshold)
+            .field("history_limit", &self.history_limit)
+            .field(
+                "recording_retention_period",
+                &self.recording_retention_period,
+            )
+            .field("paste_method", &self.paste_method)
+            .field("clipboard_handling", &self.clipboard_handling)
+            .field("auto_submit", &self.auto_submit)
+            .field("auto_submit_key", &self.auto_submit_key)
+            .field("post_process_enabled", &self.post_process_enabled)
+            .field("post_process_provider_id", &self.post_process_provider_id)
+            .field("post_process_providers", &self.post_process_providers)
+            .field("post_process_api_keys", &post_process_api_keys)
+            .field("post_process_models", &self.post_process_models)
+            .field("post_process_prompts", &self.post_process_prompts)
+            .field(
+                "post_process_selected_prompt_id",
+                &self.post_process_selected_prompt_id,
+            )
+            .field("mute_while_recording", &self.mute_while_recording)
+            .field("append_trailing_space", &self.append_trailing_space)
+            .field("app_language", &self.app_language)
+            .field("experimental_enabled", &self.experimental_enabled)
+            .field("keyboard_implementation", &self.keyboard_implementation)
+            .field("show_tray_icon", &self.show_tray_icon)
+            .field("paste_delay_ms", &self.paste_delay_ms)
+            .field("typing_tool", &self.typing_tool)
+            .field("external_script_path", &self.external_script_path)
+            .field("long_audio_model", &self.long_audio_model)
+            .field(
+                "long_audio_threshold_seconds",
+                &self.long_audio_threshold_seconds,
+            )
+            .field("gemini_api_key", &gemini_api_key)
+            .field("gemini_model", &self.gemini_model)
+            .field(
+                "insanely_fast_whisper_model",
+                &self.insanely_fast_whisper_model,
+            )
+            .field("post_process_actions", &self.post_process_actions)
+            .field("saved_processing_models", &self.saved_processing_models)
+            .field("cpu_threads", &self.cpu_threads)
+            .field("preload_model_on_startup", &self.preload_model_on_startup)
+            .finish()
+    }
 }
 
 fn default_model() -> String {
@@ -862,7 +950,10 @@ pub fn load_or_create_app_settings(app: &AppHandle) -> AppSettings {
         // Parse the entire settings object
         match serde_json::from_value::<AppSettings>(settings_value) {
             Ok(mut settings) => {
-                debug!("Found existing settings: {:?}", settings);
+                // Do not log the full settings object: it carries provider
+                // credentials. The sanitized `Debug` impl already redacts them,
+                // but we avoid dumping the whole struct on every load anyway.
+                debug!("Loaded existing settings from store");
                 let default_settings = get_default_settings();
                 let mut updated = false;
 
@@ -968,5 +1059,23 @@ mod tests {
         let settings = get_default_settings();
         assert!(!settings.auto_submit);
         assert_eq!(settings.auto_submit_key, AutoSubmitKey::Enter);
+    }
+
+    #[test]
+    fn debug_output_never_contains_credentials() {
+        let mut settings = get_default_settings();
+        settings.gemini_api_key = Some("gemini-secret-sentinel".into());
+        settings
+            .post_process_api_keys
+            .insert("openai".into(), "openai-secret-sentinel".into());
+
+        let output = format!("{settings:?}");
+        assert!(!output.contains("gemini-secret-sentinel"));
+        assert!(!output.contains("openai-secret-sentinel"));
+        // The redaction marker should be present so we know the fields are
+        // still rendered (just sanitized), not silently dropped.
+        assert!(output.contains("[REDACTED]"));
+        // Provider ids are not secret and remain visible for debugging.
+        assert!(output.contains("openai"));
     }
 }
