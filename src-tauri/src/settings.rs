@@ -508,7 +508,11 @@ fn default_autostart_enabled() -> bool {
 }
 
 fn default_update_checks_enabled() -> bool {
-    true
+    // This fork does not yet publish a signed `latest.json` updater feed, and it
+    // must never install releases from the upstream `Melvynx/Parler` feed. Until
+    // a signed rtisne/Parler feed exists (see docs/upstream-sync.md), automatic
+    // update checks are disabled by default.
+    false
 }
 
 fn default_selected_language() -> String {

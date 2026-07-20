@@ -502,6 +502,7 @@
     "upToDate": "已是最新版本",
     "downloadUpdate": "下载更新",
     "restart": "重启",
+    "updateCheckingUnavailable": "此版本未配置自动更新",
     "updateCheckingDisabled": "更新检查已禁用",
     "downloading": "下载中... {{progress}}%",
     "installing": "安装中...",

@@ -10,6 +10,13 @@ interface UpdateCheckerProps {
   className?: string;
 }
 
+// This fork does not yet ship a signed `latest.json` updater feed, and it must
+// never install releases from the upstream `Melvynx/Parler` feed. Until a signed
+// rtisne/Parler feed is configured (see docs/upstream-sync.md), the updater is
+// treated as unavailable: no update check is ever performed, regardless of any
+// previously-stored `update_checks_enabled` value.
+const UPDATER_CONFIGURED: boolean = false;
+
 const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
   const { t } = useTranslation();
   // Update checking state
@@ -21,7 +28,11 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
 
   const { settings, isLoading } = useSettings();
   const settingsLoaded = !isLoading && settings !== null;
-  const updateChecksEnabled = settings?.update_checks_enabled ?? false;
+  // Only ever check for updates when a real signed feed is configured for this
+  // distribution. This guards against stored settings that still have update
+  // checks enabled from a previous version.
+  const updateChecksEnabled =
+    UPDATER_CONFIGURED && (settings?.update_checks_enabled ?? false);
 
   const upToDateTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
   const isManualCheckRef = useRef(false);
@@ -141,6 +152,9 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
 
   // Update status functions
   const getUpdateStatusText = () => {
+    if (!UPDATER_CONFIGURED) {
+      return t("footer.updateCheckingUnavailable");
+    }
     if (!updateChecksEnabled) {
       return t("footer.updateCheckingDisabled");
     }

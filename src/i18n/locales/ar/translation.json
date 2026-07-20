@@ -502,6 +502,7 @@
     "upToDate": "محدث",
     "downloadUpdate": "تنزيل التحديث",
     "restart": "إعادة تشغيل",
+    "updateCheckingUnavailable": "التحديثات التلقائية غير مُهيأة لهذا الإصدار",
     "updateCheckingDisabled": "تم تعطيل التحقق من التحديث",
     "downloading": "...جاري التنزيل {{progress}}%",
     "installing": "...جاري التثبيت",
