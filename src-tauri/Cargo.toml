@@ -95,13 +95,16 @@ windows = { version = "0.61.3", features = [
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",
 ] }
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2.1" }
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk-layer-shell = { version = "0.8", features = ["v0_6"] }
 gtk = "0.18"
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
 
 [patch.crates-io]
 tauri-runtime = { git = "https://github.com/cjpais/tauri.git", branch = "handy-2.9.1" }
