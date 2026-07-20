@@ -15,6 +15,7 @@ pub mod insanely_fast_whisper_client;
 mod llm_client;
 mod managers;
 mod overlay;
+mod secrets;
 mod settings;
 mod shortcut;
 mod signal_handle;
@@ -396,6 +397,9 @@ pub fn run(cli_args: CliArgs) {
         commands::history::reprocess_history_entry,
         commands::gemini::change_gemini_api_key_setting,
         commands::gemini::change_gemini_model_setting,
+        commands::secrets::set_provider_credential,
+        commands::secrets::delete_provider_credential,
+        commands::secrets::get_provider_credential_status,
         commands::insanely_fast_whisper::change_insanely_fast_whisper_model_setting,
         commands::hardware::get_hardware_info,
         helpers::clamshell::is_laptop,
@@ -494,6 +498,12 @@ pub fn run(cli_args: CliArgs) {
             let app_handle = app.handle().clone();
             app.manage(TranscriptionCoordinator::new(app_handle.clone()));
             app.manage(actions::ActiveActionState(std::sync::Mutex::new(None)));
+
+            // Credentials managed through this store use the OS keyring
+            // exclusively. Legacy settings are migrated separately.
+            let secret_store: crate::secrets::SharedSecretStore =
+                std::sync::Arc::new(crate::secrets::KeyringSecretStore::new());
+            app.manage(secret_store);
 
             initialize_core_logic(&app_handle);
 

@@ -4,6 +4,7 @@ pub mod hardware;
 pub mod history;
 pub mod insanely_fast_whisper;
 pub mod models;
+pub mod secrets;
 pub mod transcription;
 
 use crate::settings::{get_settings, write_settings, AppSettings, LogLevel};

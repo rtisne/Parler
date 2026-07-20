@@ -812,6 +812,30 @@ async changeGeminiModelSetting(model: string) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async setProviderCredential(providerId: string, secret: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_provider_credential", { providerId, secret }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteProviderCredential(providerId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_provider_credential", { providerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getProviderCredentialStatus(providerId: string) : Promise<Result<CredentialStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_provider_credential_status", { providerId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async changeInsanelyFastWhisperModelSetting(model: string) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_insanely_fast_whisper_model_setting", { model }) };
@@ -854,6 +878,7 @@ export type AudioDevice = { index: string; name: string; is_default: boolean }
 export type AutoSubmitKey = "enter" | "ctrl_enter" | "cmd_enter"
 export type BindingResponse = { success: boolean; binding: ShortcutBinding | null; error: string | null }
 export type ClipboardHandling = "dont_modify" | "copy_to_clipboard"
+export type CredentialStatus = { configured: boolean; backend_available: boolean }
 export type CustomSounds = { start: boolean; stop: boolean }
 export type EngineType = "Whisper" | "Parakeet" | "Moonshine" | "MoonshineStreaming" | "SenseVoice" | "GeminiApi" | "InsanelyFastWhisper"
 export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_action_key: number | null; model_name: string | null }
