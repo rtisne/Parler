@@ -206,7 +206,16 @@ describe("Installer lifecycle gates", () => {
 
   test("legacy manual Windows build delegates both architectures and cannot publish directly", () => {
     const legacy = workflow("build-windows.yml");
+    const parsed = Bun.YAML.parse(legacy) as any;
+    const reusableJobs = Object.values(parsed.jobs).filter(
+      (job: any) => job.uses === "./.github/workflows/build.yml",
+    ) as any[];
 
+    expect(reusableJobs).toHaveLength(1);
+    expect(reusableJobs[0].permissions).toEqual({ contents: "read" });
+    expect(
+      Object.prototype.hasOwnProperty.call(reusableJobs[0], "secrets"),
+    ).toBe(false);
     expect(legacy).toContain("uses: ./.github/workflows/build.yml");
     expect(legacy).toContain('platform: "windows-latest"');
     expect(legacy).toContain('platform: "windows-11-arm"');
@@ -214,9 +223,5 @@ describe("Installer lifecycle gates", () => {
     expect(legacy).toContain('target: "aarch64-pc-windows-msvc"');
     expect(legacy).not.toContain("softprops/action-gh-release");
     expect(legacy).not.toContain("create-release:");
-    expect(legacy).toContain("contents: read");
-    expect(legacy).not.toContain("contents: write");
-    expect(legacy).not.toContain("id-token: write");
-    expect(legacy).not.toContain("secrets: inherit");
   });
 });

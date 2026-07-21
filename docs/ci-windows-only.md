@@ -62,8 +62,10 @@ NSIS it performs:
 2. **Bounded silent install** — `msiexec /i … /qn` (MSI, per-machine → HKLM)
    or the uppercase `/S` NSIS switch (per-user → `%LOCALAPPDATA%\Parler`, HKCU).
    A pre-install registry snapshot prevents a stale same-name entry from being
-   selected. Every launched process is assigned to a Windows Job Object with
-   kill-on-close, so descendants are terminated even after the root exits.
+   selected. A synchronization-gated PowerShell wrapper is assigned to a Windows
+   Job Object with kill-on-close **before** it can launch the target, so an
+   immediate-spawn/immediate-exit bootstrapper and all descendants remain
+   contained.
 3. **Resolve the installed exe** from the uninstall-registry metadata
    (`DisplayName -eq 'Parler'` across all four HKLM/HKCU + WOW6432Node hives),
    via `InstallLocation` with an exact-filename `DisplayIcon` fallback that must
@@ -78,27 +80,33 @@ NSIS it performs:
 4. **Bounded launch survival** — launch `parler.exe --no-tray`, keep it alive
    for a fixed window, scan stderr for startup panics, enforce a 10 MiB log
    safety limit, then terminate the Job Object before the final bounded file
-   reads and confirm the product process is gone.
-5. **Real silent uninstall** — `msiexec /x {ProductCode}` or the NSIS
-   `QuietUninstallString`/`UninstallString` (with `/S`). Because an NSIS
-   uninstaller detaches a `%TEMP%` copy and returns early, completion is
-   confirmed with a bounded process wait and poll (up to 120 s) until both the
-   exact selected registry key (`PSPath`) and the executable are gone. An
-   unrelated same-name entry cannot affect the result. Failure paths either run
-   the same uninstall cleanup in `finally` or report explicitly that safe entry
-   discovery was impossible.
-6. **Residue verification** — the full registry `InstallLocation` must be
-   removed or empty; any remaining file/directory or traversal error fails the
-   gate.
+   reads and confirm the product process is gone. A transient Windows sharing
+   violation after termination is retried for at most five seconds; other read
+   errors fail immediately.
+5. **Real silent uninstall** — `msiexec /x {ProductCode}` or the validated NSIS
+   `uninstall.exe` with a fixed `/S` argument; all registry-provided arguments
+   are discarded. Because an NSIS uninstaller detaches a `%TEMP%` copy and
+   returns early, completion is confirmed with a bounded process wait and poll
+   (up to 120 s) until both the exact selected registry key (`PSPath`) and the
+   executable are gone. An unrelated same-name entry cannot affect the result.
+   Registry provider/access errors fail closed rather than being interpreted as
+   an empty registry. Failure paths either run the same uninstall cleanup in
+   `finally` or report explicitly that safe entry discovery was impossible.
+6. **Residue verification** — the validated installation root (the normalized
+   registry `InstallLocation`, or the existing NSIS uninstaller's parent when
+   that value is absent) must be removed or empty; any remaining file/directory
+   or traversal error fails the gate.
 
 On failure, MSI logs and the app's stdout/stderr (isolated per installer type)
 are uploaded as the
 `installer-lifecycle-logs-<target>` artifact.
 
 The helper's pure logic (file resolution, entry selection, command
-construction, exe resolution, residue assertion) is covered by
-`.github/scripts/installer-lifecycle.Tests.ps1` (Pester 5), run by the
-`powershell-tests` job.
+construction, exe resolution, residue assertion and failure cleanup) is covered
+by `.github/scripts/installer-lifecycle.Tests.ps1` (Pester 5), run by the
+`powershell-tests` job. Its Windows-native case starts a child immediately,
+lets the tracked parent exit first, then verifies that closing the Job still
+terminates the child.
 
 ## Why publication is gated
 

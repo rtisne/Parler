@@ -17,6 +17,7 @@ BeforeAll {
             Killed = $false
             Id = 4242
         }
+        $fake | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
         $fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
             param($TimeoutMilliseconds)
             if ($null -eq $TimeoutMilliseconds) { return $true }
@@ -36,6 +37,25 @@ AfterAll {
         Remove-Item Env:PARLER_LIFECYCLE_NO_RUN -ErrorAction SilentlyContinue
     } else {
         $env:PARLER_LIFECYCLE_NO_RUN = $script:previousLifecycleGuard
+    }
+}
+
+Describe "Stop-ProductProcesses" {
+    It "stops only the process at the validated executable path" {
+        $targetPath = [System.IO.Path]::GetFullPath((Join-Path ([System.IO.Path]::GetTempPath()) "trusted/parler.exe"))
+        $otherPath = [System.IO.Path]::GetFullPath((Join-Path ([System.IO.Path]::GetTempPath()) "other/parler.exe"))
+        $target = [PSCustomObject]@{ Path = $targetPath; Id = 1 }
+        $other = [PSCustomObject]@{ Path = $otherPath; Id = 2 }
+        $script:processReads = 0
+        Mock Get-Process {
+            $script:processReads++
+            if ($script:processReads -eq 1) { return @($target, $other) }
+            return @()
+        }
+        Mock Stop-ProcessTree {}
+
+        Stop-ProductProcesses -ExePath $targetPath
+        Should -Invoke Stop-ProcessTree -Times 1 -Exactly -ParameterFilter { $Process.Path -eq $targetPath }
     }
 }
 
@@ -65,6 +85,18 @@ Describe "Get-InstallerFile" {
         $nsisDir = New-Item -ItemType Directory -Path (Join-Path $testBundleDir "nsis")
         New-Item -ItemType File -Path (Join-Path $nsisDir "Parler_0.1.0_x64-setup.exe") | Out-Null
         Get-InstallerFile -BundleDir $testBundleDir -InstallerType nsis | Should -Match "setup.exe"
+    }
+}
+
+Describe "Get-UninstallEntries" {
+    It "ignores only missing registry paths" {
+        Mock Get-ItemProperty { throw [System.Management.Automation.ItemNotFoundException]::new("missing") }
+        @(Get-UninstallEntries).Count | Should -Be 0
+    }
+
+    It "propagates registry provider and access failures" {
+        Mock Get-ItemProperty { throw [System.UnauthorizedAccessException]::new("access denied") }
+        { Get-UninstallEntries } | Should -Throw "*access denied*"
     }
 }
 
@@ -163,15 +195,31 @@ Describe "Get-UninstallCommand" {
         }
     }
 
+    It "rejects an unbalanced quote in NSIS InstallLocation" {
+        $installDir = New-TempDir
+        try {
+            $uninstaller = Join-Path $installDir "uninstall.exe"
+            New-Item -ItemType File -Path $uninstaller | Out-Null
+            $entry = [PSCustomObject]@{
+                QuietUninstallString = "`"$uninstaller`" /S"
+                InstallLocation = "`"$installDir"
+            }
+            { Get-UninstallCommand -Entry $entry -InstallerType nsis -LogDir ([System.IO.Path]::GetTempPath()) } |
+                Should -Throw "*missing InstallLocation*"
+        } finally {
+            Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
+        }
+    }
+
     It "parses a trusted QuietUninstallString for NSIS" {
         $installDir = New-TempDir
         try {
             $uninstaller = Join-Path $installDir "uninstall.exe"
             New-Item -ItemType File -Path $uninstaller | Out-Null
-            $entry = [PSCustomObject]@{ InstallLocation = $installDir; QuietUninstallString = "`"$uninstaller`" /S" }
+            $entry = [PSCustomObject]@{ InstallLocation = $installDir; QuietUninstallString = "`"$uninstaller`" /S _?=C:\attacker /D=C:\elsewhere" }
             $cmd = Get-UninstallCommand -Entry $entry -InstallerType nsis -LogDir ([System.IO.Path]::GetTempPath())
             $cmd.File | Should -Be $uninstaller
-            $cmd.Args | Should -Match "/S"
+            $cmd.Args | Should -Be "/S"
         } finally {
             Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
         }
@@ -314,6 +362,24 @@ Describe "Assert-UninstallResidue" {
 }
 
 Describe "Get-BoundedLogContent" {
+    It "retries a transient sharing violation after process termination" {
+        $path = Join-Path (New-TempDir) "locked.log"
+        try {
+            Set-Content -LiteralPath $path -Value "placeholder"
+            $script:openAttempts = 0
+            Mock Open-LaunchLogForRead {
+                $script:openAttempts++
+                if ($script:openAttempts -eq 1) { throw [System.IO.IOException]::new("file is in use") }
+                return [System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes("startup ok"))
+            }
+
+            Get-BoundedLogContent -Path $path -MaxBytes 16 -OpenRetrySeconds 1 | Should -Be "startup ok"
+            Should -Invoke Open-LaunchLogForRead -Times 2 -Exactly
+        } finally {
+            Remove-Item -LiteralPath (Split-Path -Parent $path) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     It "rejects a log larger than the byte cap" {
         $dir = New-TempDir
         try {
@@ -337,9 +403,31 @@ Describe "Get-BoundedLogContent" {
     }
 }
 
+Describe "Windows Job Object ownership" {
+    It "reports assignment, job cleanup, process kill, and liveness failures together" {
+        $fake = New-FakeProcess -Completes $false
+        $fake | Add-Member -MemberType ScriptMethod -Name Kill -Force -Value { throw "kill denied" }
+        Mock New-ProcessJobHandle { [IntPtr]123 }
+        Mock Add-ProcessToJob { throw "assignment denied" }
+        Mock Stop-NativeProcessJob { throw "job cleanup denied" }
+
+        { Register-ProcessJob -Process $fake -ForceWindowsSemantics } |
+            Should -Throw "*assignment denied*job cleanup denied*kill denied*still running*"
+    }
+
+    It "invalidates handle ownership before native termination" {
+        $fake = New-FakeProcess -Completes $true
+        $fake | Add-Member -MemberType NoteProperty -Name ParlerJobHandle -Value ([IntPtr]123) -Force
+        Mock Stop-NativeProcessJob { throw "terminate failed" }
+
+        { Stop-ProcessTree -Process $fake } | Should -Throw "*terminate failed*"
+        $fake.ParlerJobHandle | Should -Be ([IntPtr]::Zero)
+    }
+}
+
 Describe "Invoke-BoundedProcess" {
     BeforeEach {
-        Mock Register-ProcessJob { return $Process }
+        Mock Start-TrackedProcess { return $script:fakeProcess }
     }
 
     It "kills the process tree and throws when the timeout expires" {
@@ -379,15 +467,14 @@ Describe "Windows Job Object process-tree integration" {
             $pidFile = Join-Path $dir "child.pid"
             $scriptFile = Join-Path $dir "spawn-child.ps1"
             $scriptText = @'
-Start-Sleep -Milliseconds 750
 $child = Start-Process -FilePath pwsh -ArgumentList @("-NoProfile", "-Command", "Start-Sleep -Seconds 60") -PassThru
 Set-Content -LiteralPath '__PID_FILE__' -Value $child.Id
 '@
             $scriptText = $scriptText.Replace('__PID_FILE__', $pidFile.Replace("'", "''"))
             Set-Content -LiteralPath $scriptFile -Value $scriptText
 
-            $parent = Start-Process -FilePath pwsh -ArgumentList @("-NoProfile", "-File", $scriptFile) -PassThru
-            $parent = Register-ProcessJob -Process $parent
+            $parentArguments = "-NoProfile -File `"$scriptFile`""
+            $parent = Start-TrackedProcess -FilePath pwsh -ArgumentList $parentArguments
             $parent.WaitForExit(10000) | Should -BeTrue
 
             $deadline = (Get-Date).AddSeconds(10)
@@ -447,7 +534,16 @@ Describe "bounded installer integration" {
             Should -Not -Throw
     }
 
-    It "cleans a detached uninstaller when completion polling times out" {
+    It "fails closed when uninstall registry enumeration errors" {
+        $script:fakeProcess = New-FakeProcess -Completes $true -ExitCode 0
+        Mock Invoke-BoundedProcess { return $script:fakeProcess }
+        Mock Get-UninstallEntries { throw "registry access denied" }
+
+        { Invoke-Uninstall -Command @{ File = "uninstall.exe"; Args = "/S" } -EntryIdentity "Registry::target" -ExePath "" -TimeoutSeconds 1 } |
+            Should -Throw "*registry access denied*"
+    }
+
+    It "does not globally kill same-name uninstallers when completion polling times out" {
         $script:fakeProcess = New-FakeProcess -Completes $true -ExitCode 0
         Mock Invoke-BoundedProcess { return $script:fakeProcess }
         Mock Get-UninstallEntries { @([PSCustomObject]@{ PSPath = "Registry::target"; DisplayName = "Parler" }) }
@@ -455,7 +551,7 @@ Describe "bounded installer integration" {
 
         { Invoke-Uninstall -Command @{ File = "uninstall.exe"; Args = "/S" } -EntryIdentity "Registry::target" -ExePath "" -TimeoutSeconds 1 } |
             Should -Throw "*did not complete*"
-        Should -Invoke Stop-ProductProcesses -Times 1 -Exactly -ParameterFilter { $BinaryName -eq "uninstall.exe" }
+        Should -Invoke Stop-ProductProcesses -Times 0 -Exactly
     }
 }
 
@@ -507,6 +603,7 @@ Describe "Invoke-InstallerLifecycle cleanup" {
         { Invoke-InstallerLifecycle -InstallerType msi -BundleDir "C:\bundle" -ProductName "Parler" -BinaryName "parler.exe" -LaunchSeconds 1 -InstallTimeoutSeconds 1 -UninstallTimeoutSeconds 1 } |
             Should -Throw "*Pre-existing*"
         Should -Invoke Install-Installer -Times 0 -Exactly
+        Should -Invoke Stop-ProductProcesses -Times 0 -Exactly
     }
 
     It "reports cleanup discovery failure instead of silently skipping uninstall" {
@@ -519,6 +616,23 @@ Describe "Invoke-InstallerLifecycle cleanup" {
 
         { Invoke-InstallerLifecycle -InstallerType msi -BundleDir "C:\bundle" -ProductName "Parler" -BinaryName "parler.exe" -LaunchSeconds 1 -InstallTimeoutSeconds 1 -UninstallTimeoutSeconds 1 } |
             Should -Throw "*Unable to identify installed entry for cleanup*"
+        Should -Invoke Invoke-Uninstall -Times 0 -Exactly
+    }
+
+    It "reports post-install registry enumeration failure during cleanup discovery" {
+        $script:registryReads = 0
+        Mock Get-InstallerFile { "C:\bundle\Parler.msi" }
+        Mock Get-UninstallEntries {
+            $script:registryReads++
+            if ($script:registryReads -eq 1) { return @() }
+            throw "registry provider unavailable"
+        }
+        Mock Install-Installer {}
+        Mock Stop-ProductProcesses {}
+        Mock Invoke-Uninstall {}
+
+        { Invoke-InstallerLifecycle -InstallerType msi -BundleDir "C:\bundle" -ProductName "Parler" -BinaryName "parler.exe" -LaunchSeconds 1 -InstallTimeoutSeconds 1 -UninstallTimeoutSeconds 1 } |
+            Should -Throw "*registry provider unavailable*Unable to identify installed entry for cleanup*"
         Should -Invoke Invoke-Uninstall -Times 0 -Exactly
     }
 

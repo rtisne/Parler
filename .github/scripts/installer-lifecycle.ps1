@@ -132,52 +132,163 @@ public static class ParlerProcessJob
 '@
 }
 
-function Register-ProcessJob {
-    param([Parameter(Mandatory = $true)]$Process)
-
-    if (-not $IsWindows) { return $Process }
+function New-ProcessJobHandle {
     Initialize-ProcessJobApi
-    $job = [ParlerProcessJob]::CreateKillOnClose()
+    return [ParlerProcessJob]::CreateKillOnClose()
+}
+
+function Add-ProcessToJob {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$JobHandle,
+        [Parameter(Mandatory = $true)][int]$ProcessId
+    )
+    [ParlerProcessJob]::Assign($JobHandle, $ProcessId)
+}
+
+function Stop-NativeProcessJob {
+    param([Parameter(Mandatory = $true)][IntPtr]$JobHandle)
+    [ParlerProcessJob]::TerminateAndClose($JobHandle)
+}
+
+function Register-ProcessJob {
+    param(
+        [Parameter(Mandatory = $true)]$Process,
+        [switch]$ForceWindowsSemantics
+    )
+
+    if (-not $IsWindows -and -not $ForceWindowsSemantics) { return $Process }
+    $job = New-ProcessJobHandle
     try {
-        [ParlerProcessJob]::Assign($job, [int]$Process.Id)
+        Add-ProcessToJob -JobHandle $job -ProcessId ([int]$Process.Id)
         $Process | Add-Member -MemberType NoteProperty -Name ParlerJobHandle -Value $job -Force
         return $Process
     } catch {
-        try { [ParlerProcessJob]::TerminateAndClose($job) } catch { }
-        try { $Process.Kill($true) } catch { }
-        throw "Could not place process $($Process.Id) in a kill-on-close Windows Job Object: $($_.Exception.Message)"
+        $assignmentError = $_.Exception.Message
+        $cleanupErrors = [System.Collections.Generic.List[string]]::new()
+        try { Stop-NativeProcessJob -JobHandle $job } catch { $cleanupErrors.Add("job cleanup failed: $($_.Exception.Message)") }
+
+        $hasExited = $false
+        try {
+            $Process.Refresh()
+            $hasExited = [bool]$Process.HasExited
+        } catch {
+            $cleanupErrors.Add("process state refresh failed: $($_.Exception.Message)")
+        }
+        if (-not $hasExited) {
+            try { $Process.Kill($true) } catch { $cleanupErrors.Add("process kill failed: $($_.Exception.Message)") }
+            try {
+                $Process.Refresh()
+                $hasExited = [bool]$Process.HasExited
+                if (-not $hasExited) { $hasExited = [bool]$Process.WaitForExit(5000) }
+            } catch {
+                $cleanupErrors.Add("process exit verification failed: $($_.Exception.Message)")
+            }
+        }
+        if (-not $hasExited) { $cleanupErrors.Add("process is still running after cleanup") }
+
+        $suffix = if ($cleanupErrors.Count -gt 0) { "; cleanup failures: $($cleanupErrors -join '; ')" } else { "" }
+        throw "Could not place process $($Process.Id) in a kill-on-close Windows Job Object: $assignmentError$suffix"
     }
 }
 
-# Compile the native bridge before the first process is launched. Compiling it
-# inside Register-ProcessJob creates a race where a short-lived root can exit
-# (and detach children) while Add-Type is still running.
+# Compile the native bridge before the first process is launched. The tracked
+# wrapper remains blocked until assignment succeeds, so its target cannot race
+# ahead of AssignProcessToJobObject.
 if ($IsWindows) { Initialize-ProcessJobApi }
 
 function Stop-ProcessTree {
     param([Parameter(Mandatory = $true)]$Process)
 
+    $cleanupErrors = [System.Collections.Generic.List[string]]::new()
     $jobProperty = $Process.PSObject.Properties["ParlerJobHandle"]
     if ($jobProperty -and [IntPtr]$jobProperty.Value -ne [IntPtr]::Zero) {
         $jobHandle = [IntPtr]$jobProperty.Value
-        try {
-            [ParlerProcessJob]::TerminateAndClose($jobHandle)
-            $Process.ParlerJobHandle = [IntPtr]::Zero
-        } catch {
-            throw "Windows Job Object cleanup failed for process $($Process.Id): $($_.Exception.Message)"
+        # Atomically relinquish ownership before a native call that always
+        # closes the handle, even when TerminateJobObject itself fails.
+        $Process.ParlerJobHandle = [IntPtr]::Zero
+        try { Stop-NativeProcessJob -JobHandle $jobHandle } catch {
+            $cleanupErrors.Add("Windows Job Object cleanup failed for process $($Process.Id): $($_.Exception.Message)")
         }
     }
 
-    try { $Process.Refresh() } catch { }
-    if ($Process.HasExited) { return }
+    $hasExited = $false
     try {
-        $Process.Kill($true)
+        $Process.Refresh()
+        $hasExited = [bool]$Process.HasExited
     } catch {
-        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+        $cleanupErrors.Add("Process state refresh failed for $($Process.Id): $($_.Exception.Message)")
     }
-    try { $Process.Refresh() } catch { }
-    if (-not $Process.HasExited -and -not $Process.WaitForExit(5000)) {
-        throw "Process tree $($Process.Id) did not terminate within 5 seconds after kill."
+    if (-not $hasExited) {
+        try { $Process.Kill($true) } catch {
+            try { Stop-Process -Id $Process.Id -Force -ErrorAction Stop } catch {
+                $cleanupErrors.Add("Process kill failed for $($Process.Id): $($_.Exception.Message)")
+            }
+        }
+        try {
+            $Process.Refresh()
+            $hasExited = [bool]$Process.HasExited
+            if (-not $hasExited) { $hasExited = [bool]$Process.WaitForExit(5000) }
+        } catch {
+            $cleanupErrors.Add("Process exit verification failed for $($Process.Id): $($_.Exception.Message)")
+        }
+        if (-not $hasExited) { $cleanupErrors.Add("Process tree $($Process.Id) did not terminate within 5 seconds after kill.") }
+    }
+
+    $tempProperty = $Process.PSObject.Properties["ParlerProcessTempDir"]
+    if ($tempProperty -and $tempProperty.Value) {
+        try { Remove-Item -LiteralPath ([string]$tempProperty.Value) -Recurse -Force -ErrorAction Stop } catch {
+            $cleanupErrors.Add("Process wrapper cleanup failed: $($_.Exception.Message)")
+        }
+        $Process.ParlerProcessTempDir = ""
+    }
+    if ($cleanupErrors.Count -gt 0) { throw ($cleanupErrors -join "; ") }
+}
+
+function Start-TrackedProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string]$ArgumentList = "",
+        [string]$RedirectStandardOutput = "",
+        [string]$RedirectStandardError = ""
+    )
+
+    if (-not $IsWindows) {
+        $start = @{ FilePath = $FilePath; ArgumentList = $ArgumentList; PassThru = $true }
+        if ($RedirectStandardOutput) { $start.RedirectStandardOutput = $RedirectStandardOutput }
+        if ($RedirectStandardError) { $start.RedirectStandardError = $RedirectStandardError }
+        return Start-Process @start
+    }
+
+    $tempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [System.IO.Path]::GetTempPath() }
+    $tempDir = Join-Path $tempRoot ("parler-process-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $tempDir -ErrorAction Stop | Out-Null
+    $payloadPath = Join-Path $tempDir "payload.json"
+    $readyPath = Join-Path $tempDir "assigned.ready"
+    $payload = @{
+        FilePath = $FilePath
+        ArgumentList = $ArgumentList
+        RedirectStandardOutput = $RedirectStandardOutput
+        RedirectStandardError = $RedirectStandardError
+    } | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText($payloadPath, $payload, [System.Text.UTF8Encoding]::new($false))
+
+    $wrapperPath = Join-Path $PSScriptRoot "process-job-wrapper.ps1"
+    $wrapper = $null
+    try {
+        $wrapperArguments = "-NoLogo -NoProfile -NonInteractive -File `"$wrapperPath`" -PayloadPath `"$payloadPath`" -ReadyPath `"$readyPath`""
+        $wrapper = Start-Process -FilePath "pwsh" -ArgumentList $wrapperArguments -PassThru
+        $wrapper = Register-ProcessJob -Process $wrapper
+        $wrapper | Add-Member -MemberType NoteProperty -Name ParlerProcessTempDir -Value $tempDir -Force
+        [System.IO.File]::WriteAllText($readyPath, "assigned", [System.Text.UTF8Encoding]::new($false))
+        return $wrapper
+    } catch {
+        $startError = $_.Exception.Message
+        if ($wrapper) {
+            try { Stop-ProcessTree -Process $wrapper } catch { $startError += "; wrapper cleanup failed: $($_.Exception.Message)" }
+        } else {
+            Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        throw "Could not start tracked process '$FilePath': $startError"
     }
 }
 
@@ -189,7 +300,7 @@ function Invoke-BoundedProcess {
         [Parameter(Mandatory = $true)][string]$Description
     )
 
-    $process = Register-ProcessJob -Process (Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru)
+    $process = Start-TrackedProcess -FilePath $FilePath -ArgumentList $ArgumentList
     try {
         $completed = $process.WaitForExit($TimeoutSeconds * 1000)
     } catch {
@@ -207,15 +318,23 @@ function Invoke-BoundedProcess {
 }
 
 function Stop-ProductProcesses {
-    param([Parameter(Mandatory = $true)][string]$BinaryName)
+    param([Parameter(Mandatory = $true)][string]$ExePath)
 
-    $processName = [System.IO.Path]::GetFileNameWithoutExtension($BinaryName)
+    if ([string]::IsNullOrWhiteSpace($ExePath)) { return }
+    $expectedPath = [System.IO.Path]::GetFullPath($ExePath)
+    $processName = [System.IO.Path]::GetFileNameWithoutExtension($expectedPath)
     foreach ($candidate in @(Get-Process -Name $processName -ErrorAction SilentlyContinue)) {
-        Stop-ProcessTree -Process $candidate
+        $candidatePath = ""
+        try { $candidatePath = [string]$candidate.Path } catch { continue }
+        if ($candidatePath -and ([System.IO.Path]::GetFullPath($candidatePath) -ieq $expectedPath)) {
+            Stop-ProcessTree -Process $candidate
+        }
     }
-    $lingering = @(Get-Process -Name $processName -ErrorAction SilentlyContinue)
+    $lingering = @(Get-Process -Name $processName -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.Path -and ([System.IO.Path]::GetFullPath([string]$_.Path) -ieq $expectedPath) } catch { $false }
+    })
     if ($lingering.Count -gt 0) {
-        throw "$BinaryName process cleanup failed; $($lingering.Count) instance(s) still running."
+        throw "Installed executable process cleanup failed for '$expectedPath'; $($lingering.Count) instance(s) still running."
     }
 }
 
@@ -240,7 +359,11 @@ function Get-InstallerFile {
 
 function Get-UninstallEntries {
     $entries = foreach ($hive in $script:UninstallHives) {
-        Get-ItemProperty -Path $hive -ErrorAction SilentlyContinue
+        try {
+            Get-ItemProperty -Path $hive -ErrorAction Stop
+        } catch [System.Management.Automation.ItemNotFoundException] {
+            continue
+        }
     }
     return @($entries)
 }
@@ -359,6 +482,16 @@ function Split-CommandLine {
     return @{ File = $file; Args = $arguments }
 }
 
+function Normalize-RegistryPath {
+    param([AllowEmptyString()][string]$Path)
+
+    $normalized = $Path.Trim()
+    if ($normalized.Length -ge 2 -and $normalized.StartsWith('"') -and $normalized.EndsWith('"')) {
+        $normalized = $normalized.Substring(1, $normalized.Length - 2)
+    }
+    return [Environment]::ExpandEnvironmentVariables($normalized)
+}
+
 function Get-UninstallCommand {
     param(
         [Parameter(Mandatory = $true)]$Entry,
@@ -391,7 +524,7 @@ function Get-UninstallCommand {
     }
 
     $rawInstallLocation = [string]$Entry.InstallLocation
-    $installLocation = [Environment]::ExpandEnvironmentVariables($rawInstallLocation.Trim().Trim('"'))
+    $installLocation = Normalize-RegistryPath -Path $rawInstallLocation
     if ([string]::IsNullOrWhiteSpace($installLocation)) {
         $installRoot = (Resolve-Path (Split-Path -Parent $uninstaller)).Path
     } else {
@@ -405,11 +538,7 @@ function Get-UninstallCommand {
         }
     }
 
-    $arguments = $parsed.Args
-    if ($arguments -notmatch '(^|\s)/S(\s|$)') {
-        $arguments = ($arguments + " /S").Trim()
-    }
-    return @{ File = $uninstaller; Args = $arguments; InstallRoot = $installRoot }
+    return @{ File = $uninstaller; Args = "/S"; InstallRoot = $installRoot }
 }
 
 function Assert-UninstallResidue {
@@ -482,14 +611,29 @@ function Install-Installer {
     }
 }
 
+function Open-LaunchLogForRead {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+}
+
 function Get-BoundedLogContent {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][ValidateRange(1, [long]::MaxValue)][long]$MaxBytes
+        [Parameter(Mandatory = $true)][ValidateRange(1, [long]::MaxValue)][long]$MaxBytes,
+        [ValidateRange(0, 30)][int]$OpenRetrySeconds = 5
     )
 
     if (-not (Test-Path $Path -PathType Leaf)) { return "" }
-    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    $deadline = (Get-Date).AddSeconds($OpenRetrySeconds)
+    $stream = $null
+    while (-not $stream) {
+        try {
+            $stream = Open-LaunchLogForRead -Path $Path
+        } catch [System.IO.IOException] {
+            if ((Get-Date) -ge $deadline) { throw }
+            Start-Sleep -Milliseconds 100
+        }
+    }
     try {
         if ($stream.Length -gt $MaxBytes) {
             throw "Installed Parler launch log exceeded the $MaxBytes byte safety limit: $Path"
@@ -518,13 +662,11 @@ function Invoke-LaunchGate {
     Write-Host "Launching installed $ExePath for a $LaunchSeconds second survival check"
     $process = $null
     try {
-        $process = Start-Process `
+        $process = Start-TrackedProcess `
             -FilePath $ExePath `
             -ArgumentList "--no-tray" `
             -RedirectStandardOutput $stdoutPath `
-            -RedirectStandardError $stderrPath `
-            -PassThru
-        $process = Register-ProcessJob -Process $process
+            -RedirectStandardError $stderrPath
 
         $deadline = (Get-Date).AddSeconds($LaunchSeconds)
         while ((Get-Date) -lt $deadline) {
@@ -594,12 +736,6 @@ function Invoke-Uninstall {
             Start-Sleep -Seconds 1
         } while ((Get-Date) -lt $deadline)
 
-        $uninstallerName = [System.IO.Path]::GetFileName([string]$Command.File)
-        try {
-            Stop-ProductProcesses -BinaryName $uninstallerName
-        } catch {
-            throw "Uninstall did not complete within $TimeoutSeconds seconds (registryGone=$registryGone, exeGone=$exeGone); detached uninstaller cleanup also failed: $($_.Exception.Message)"
-        }
         throw "Uninstall did not complete within $TimeoutSeconds seconds (registryGone=$registryGone, exeGone=$exeGone)."
     } finally {
         Stop-ProcessTree -Process $process
@@ -658,10 +794,12 @@ function Invoke-InstallerLifecycle {
         $errors.Add($_.Exception.Message)
     }
     finally {
-        try {
-            Stop-ProductProcesses -BinaryName $BinaryName
-        } catch {
-            $errors.Add("Process cleanup failed: $($_.Exception.Message)")
+        if ($installationStarted -and $exePath) {
+            try {
+                Stop-ProductProcesses -ExePath $exePath
+            } catch {
+                $errors.Add("Process cleanup failed: $($_.Exception.Message)")
+            }
         }
 
         if ($installationStarted -and -not $entry) {

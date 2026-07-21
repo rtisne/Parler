@@ -177,6 +177,19 @@ describe("required Windows CI topology", () => {
     ],
   };
 
+  test("discovers exactly the audited build.yml callers", () => {
+    const callers = workflowFiles()
+      .filter((name) => {
+        const workflow = parseWorkflow(name) as any;
+        return Object.values(workflow.jobs ?? {}).some(
+          (job: any) => job.uses === "./.github/workflows/build.yml",
+        );
+      })
+      .sort();
+
+    expect(callers).toEqual(Object.keys(expectedMatrices).sort());
+  });
+
   for (const [name, expected] of Object.entries(expectedMatrices)) {
     test(`${name} keeps exactly the native x64 and ARM64 matrix`, () => {
       const workflow = parseWorkflow(name) as any;
@@ -184,7 +197,9 @@ describe("required Windows CI topology", () => {
         (job: any) => job.uses === "./.github/workflows/build.yml",
       ) as any[];
       expect(reusableJobs).toHaveLength(1);
-      const include = reusableJobs[0].strategy.matrix.include;
+      const matrix = reusableJobs[0].strategy.matrix;
+      expect(Object.keys(matrix).sort()).toEqual(["include"]);
+      const include = matrix.include;
       expect(
         include.map((entry: any) => [entry.platform, entry.target, entry.args]),
       ).toEqual(expected);
