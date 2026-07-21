@@ -211,17 +211,12 @@ describe("Installer lifecycle gates", () => {
       (job: any) => job.uses === "./.github/workflows/build.yml",
     ) as any[];
 
+    expect(Object.keys(parsed.jobs)).toEqual(["build-windows"]);
     expect(reusableJobs).toHaveLength(1);
+    expect(reusableJobs[0]).toBe(parsed.jobs["build-windows"]);
     expect(reusableJobs[0].permissions).toEqual({ contents: "read" });
     expect(
       Object.prototype.hasOwnProperty.call(reusableJobs[0], "secrets"),
     ).toBe(false);
-    expect(legacy).toContain("uses: ./.github/workflows/build.yml");
-    expect(legacy).toContain('platform: "windows-latest"');
-    expect(legacy).toContain('platform: "windows-11-arm"');
-    expect(legacy).toContain('target: "x86_64-pc-windows-msvc"');
-    expect(legacy).toContain('target: "aarch64-pc-windows-msvc"');
-    expect(legacy).not.toContain("softprops/action-gh-release");
-    expect(legacy).not.toContain("create-release:");
   });
 });

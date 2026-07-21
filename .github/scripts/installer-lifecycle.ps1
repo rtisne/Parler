@@ -40,13 +40,15 @@ function Test-MsiProductCode {
 }
 
 function Initialize-ProcessJobApi {
-    if (-not $IsWindows -or ("ParlerProcessJob" -as [type])) { return }
+    param([switch]$ForceCompile)
+    if ((-not $IsWindows -and -not $ForceCompile) -or ("ParlerProcessJob" -as [type])) { return }
 
     Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 
 public static class ParlerProcessJob
 {
@@ -76,21 +78,37 @@ public static class ParlerProcessJob
         public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
     }
 
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
-    [DllImport("kernel32.dll")]
-    private static extern bool CloseHandle(IntPtr handle);
-
-    public static IntPtr CreateKillOnClose()
+    public sealed class SafeJobHandle : SafeHandleZeroOrMinusOneIsInvalid
     {
-        IntPtr job = CreateJobObject(IntPtr.Zero, null);
-        if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        private SafeJobHandle() : base(true) { }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        protected override bool ReleaseHandle() { return CloseHandle(handle); }
+
+        public void CloseChecked()
+        {
+            if (IsClosed || IsInvalid) return;
+            if (!CloseHandle(handle)) throw new Win32Exception(Marshal.GetLastWin32Error());
+            SetHandleAsInvalid();
+        }
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeJobHandle CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(SafeJobHandle job, int infoClass, IntPtr info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(SafeJobHandle job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(SafeJobHandle job, uint exitCode);
+
+    public static SafeJobHandle CreateKillOnClose()
+    {
+        SafeJobHandle job = CreateJobObject(IntPtr.Zero, null);
+        if (job == null || job.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
         var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
         info.BasicLimitInformation.LimitFlags = 0x00002000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         int size = Marshal.SizeOf(info);
@@ -104,13 +122,13 @@ public static class ParlerProcessJob
         }
         catch
         {
-            CloseHandle(job);
+            job.Dispose();
             throw;
         }
         finally { Marshal.FreeHGlobal(pointer); }
     }
 
-    public static void Assign(IntPtr job, int processId)
+    public static void Assign(SafeJobHandle job, int processId)
     {
         using (Process process = Process.GetProcessById(processId))
         {
@@ -119,14 +137,28 @@ public static class ParlerProcessJob
         }
     }
 
-    public static void TerminateAndClose(IntPtr job)
+    public static void TerminateAndClose(SafeJobHandle job)
     {
+        Exception terminationError = null;
+        Exception closeError = null;
         try
         {
             if (!TerminateJobObject(job, 1))
-                throw new Win32Exception(Marshal.GetLastWin32Error());
+                terminationError = new Win32Exception(Marshal.GetLastWin32Error());
         }
-        finally { CloseHandle(job); }
+        finally
+        {
+            try { job.CloseChecked(); }
+            catch (Exception error)
+            {
+                closeError = error;
+                job.Dispose(); // SafeHandle retains ownership after failed CloseChecked and retries release.
+            }
+        }
+        if (terminationError != null && closeError != null)
+            throw new AggregateException("Job termination and handle close both failed.", terminationError, closeError);
+        if (terminationError != null) throw terminationError;
+        if (closeError != null) throw closeError;
     }
 }
 '@
@@ -139,14 +171,14 @@ function New-ProcessJobHandle {
 
 function Add-ProcessToJob {
     param(
-        [Parameter(Mandatory = $true)][IntPtr]$JobHandle,
+        [Parameter(Mandatory = $true)]$JobHandle,
         [Parameter(Mandatory = $true)][int]$ProcessId
     )
     [ParlerProcessJob]::Assign($JobHandle, $ProcessId)
 }
 
 function Stop-NativeProcessJob {
-    param([Parameter(Mandatory = $true)][IntPtr]$JobHandle)
+    param([Parameter(Mandatory = $true)]$JobHandle)
     [ParlerProcessJob]::TerminateAndClose($JobHandle)
 }
 
@@ -201,11 +233,11 @@ function Stop-ProcessTree {
 
     $cleanupErrors = [System.Collections.Generic.List[string]]::new()
     $jobProperty = $Process.PSObject.Properties["ParlerJobHandle"]
-    if ($jobProperty -and [IntPtr]$jobProperty.Value -ne [IntPtr]::Zero) {
-        $jobHandle = [IntPtr]$jobProperty.Value
-        # Atomically relinquish ownership before a native call that always
-        # closes the handle, even when TerminateJobObject itself fails.
-        $Process.ParlerJobHandle = [IntPtr]::Zero
+    if ($jobProperty -and $jobProperty.Value -and -not $jobProperty.Value.IsClosed -and -not $jobProperty.Value.IsInvalid) {
+        $jobHandle = $jobProperty.Value
+        # Transfer the SafeHandle reference locally before native termination;
+        # its verified close remains observable and its finalizer retains leak protection.
+        $Process.ParlerJobHandle = $null
         try { Stop-NativeProcessJob -JobHandle $jobHandle } catch {
             $cleanupErrors.Add("Windows Job Object cleanup failed for process $($Process.Id): $($_.Exception.Message)")
         }
@@ -244,12 +276,26 @@ function Stop-ProcessTree {
     if ($cleanupErrors.Count -gt 0) { throw ($cleanupErrors -join "; ") }
 }
 
+function Start-ArgumentProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [AllowEmptyCollection()][string[]]$ArgumentList = @()
+    )
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $FilePath
+    $startInfo.UseShellExecute = $false
+    foreach ($argument in $ArgumentList) { $startInfo.ArgumentList.Add([string]$argument) }
+    return [System.Diagnostics.Process]::Start($startInfo)
+}
+
 function Start-TrackedProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
-        [string]$ArgumentList = "",
+        [AllowEmptyCollection()][string[]]$ArgumentList = @(),
         [string]$RedirectStandardOutput = "",
-        [string]$RedirectStandardError = ""
+        [string]$RedirectStandardError = "",
+        [scriptblock]$RegisterProcess = { param($Process) Register-ProcessJob -Process $Process }
     )
 
     if (-not $IsWindows) {
@@ -266,7 +312,7 @@ function Start-TrackedProcess {
     $readyPath = Join-Path $tempDir "assigned.ready"
     $payload = @{
         FilePath = $FilePath
-        ArgumentList = $ArgumentList
+        ArgumentList = @($ArgumentList)
         RedirectStandardOutput = $RedirectStandardOutput
         RedirectStandardError = $RedirectStandardError
     } | ConvertTo-Json -Depth 4
@@ -275,10 +321,12 @@ function Start-TrackedProcess {
     $wrapperPath = Join-Path $PSScriptRoot "process-job-wrapper.ps1"
     $wrapper = $null
     try {
-        $wrapperArguments = "-NoLogo -NoProfile -NonInteractive -File `"$wrapperPath`" -PayloadPath `"$payloadPath`" -ReadyPath `"$readyPath`""
-        $wrapper = Start-Process -FilePath "pwsh" -ArgumentList $wrapperArguments -PassThru
-        $wrapper = Register-ProcessJob -Process $wrapper
+        $wrapper = Start-ArgumentProcess -FilePath "pwsh" -ArgumentList @(
+            "-NoLogo", "-NoProfile", "-NonInteractive", "-File", $wrapperPath,
+            "-PayloadPath", $payloadPath, "-ReadyPath", $readyPath
+        )
         $wrapper | Add-Member -MemberType NoteProperty -Name ParlerProcessTempDir -Value $tempDir -Force
+        $wrapper = & $RegisterProcess $wrapper
         [System.IO.File]::WriteAllText($readyPath, "assigned", [System.Text.UTF8Encoding]::new($false))
         return $wrapper
     } catch {
@@ -295,7 +343,7 @@ function Start-TrackedProcess {
 function Invoke-BoundedProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
-        [string]$ArgumentList = "",
+        [AllowEmptyCollection()][string[]]$ArgumentList = @(),
         [Parameter(Mandatory = $true)][ValidateRange(1, 3600)][int]$TimeoutSeconds,
         [Parameter(Mandatory = $true)][string]$Description
     )
@@ -317,22 +365,41 @@ function Invoke-BoundedProcess {
     return $process
 }
 
+function Get-NamedProcessCandidates {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    return @([System.Diagnostics.Process]::GetProcessesByName($Name))
+}
+
+function Get-VerifiedProcessPath {
+    param([Parameter(Mandatory = $true)]$Process)
+    try {
+        $path = [string]$Process.Path
+        if ([string]::IsNullOrWhiteSpace($path)) { throw "empty executable path" }
+        return [System.IO.Path]::GetFullPath($path)
+    } catch {
+        throw "Could not verify executable path for process $($Process.Id): $($_.Exception.Message)"
+    }
+}
+
 function Stop-ProductProcesses {
     param([Parameter(Mandatory = $true)][string]$ExePath)
 
     if ([string]::IsNullOrWhiteSpace($ExePath)) { return }
     $expectedPath = [System.IO.Path]::GetFullPath($ExePath)
     $processName = [System.IO.Path]::GetFileNameWithoutExtension($expectedPath)
-    foreach ($candidate in @(Get-Process -Name $processName -ErrorAction SilentlyContinue)) {
-        $candidatePath = ""
-        try { $candidatePath = [string]$candidate.Path } catch { continue }
-        if ($candidatePath -and ([System.IO.Path]::GetFullPath($candidatePath) -ieq $expectedPath)) {
+    foreach ($candidate in @(Get-NamedProcessCandidates -Name $processName)) {
+        $candidatePath = Get-VerifiedProcessPath -Process $candidate
+        if ($candidatePath -ieq $expectedPath) {
             Stop-ProcessTree -Process $candidate
         }
     }
-    $lingering = @(Get-Process -Name $processName -ErrorAction SilentlyContinue | Where-Object {
-        try { $_.Path -and ([System.IO.Path]::GetFullPath([string]$_.Path) -ieq $expectedPath) } catch { $false }
-    })
+
+    $lingering = @()
+    foreach ($candidate in @(Get-NamedProcessCandidates -Name $processName)) {
+        if ((Get-VerifiedProcessPath -Process $candidate) -ieq $expectedPath) {
+            $lingering += $candidate
+        }
+    }
     if ($lingering.Count -gt 0) {
         throw "Installed executable process cleanup failed for '$expectedPath'; $($lingering.Count) instance(s) still running."
     }
@@ -486,7 +553,12 @@ function Normalize-RegistryPath {
     param([AllowEmptyString()][string]$Path)
 
     $normalized = $Path.Trim()
-    if ($normalized.Length -ge 2 -and $normalized.StartsWith('"') -and $normalized.EndsWith('"')) {
+    $startsQuoted = $normalized.StartsWith('"')
+    $endsQuoted = $normalized.EndsWith('"')
+    if ($startsQuoted -xor $endsQuoted) {
+        throw "Registry path contains an unmatched quote: '$Path'."
+    }
+    if ($normalized.Length -ge 2 -and $startsQuoted -and $endsQuoted) {
         $normalized = $normalized.Substring(1, $normalized.Length - 2)
     }
     return [Environment]::ExpandEnvironmentVariables($normalized)
@@ -506,7 +578,7 @@ function Get-UninstallCommand {
         $log = Join-Path $LogDir "msi-uninstall.log"
         return @{
             File = "msiexec.exe"
-            Args = "/x $($Entry.PSChildName) /qn /norestart /l*v `"$log`""
+            Args = @("/x", [string]$Entry.PSChildName, "/qn", "/norestart", "/l*v", $log)
         }
     }
 
@@ -538,7 +610,7 @@ function Get-UninstallCommand {
         }
     }
 
-    return @{ File = $uninstaller; Args = "/S"; InstallRoot = $installRoot }
+    return @{ File = $uninstaller; Args = @("/S"); InstallRoot = $installRoot }
 }
 
 function Assert-UninstallResidue {
@@ -571,7 +643,7 @@ function Install-Installer {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     if ($InstallerType -eq "msi") {
         $log = Join-Path $LogDir "msi-install.log"
-        $arguments = "/i `"$Path`" /qn /norestart /l*v `"$log`""
+        $arguments = @("/i", $Path, "/qn", "/norestart", "/l*v", $log)
         $process = Invoke-BoundedProcess -FilePath "msiexec.exe" -ArgumentList $arguments -TimeoutSeconds $TimeoutSeconds -Description "MSI install"
         try {
             if ($process.ExitCode -ne 0) {
@@ -583,7 +655,7 @@ function Install-Installer {
         }
     }
 
-    $process = Invoke-BoundedProcess -FilePath $Path -ArgumentList "/S" -TimeoutSeconds $TimeoutSeconds -Description "NSIS install"
+    $process = Invoke-BoundedProcess -FilePath $Path -ArgumentList @("/S") -TimeoutSeconds $TimeoutSeconds -Description "NSIS install"
     try {
         if ($process.ExitCode -ne 0) {
             throw "NSIS install failed with exit code $($process.ExitCode)."
@@ -616,6 +688,22 @@ function Open-LaunchLogForRead {
     return [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
 }
 
+function Get-LifecycleNow { return Get-Date }
+
+function Wait-LifecycleRetry { param([int]$Milliseconds) Start-Sleep -Milliseconds $Milliseconds }
+
+function Test-IsSharingViolation {
+    param([Parameter(Mandatory = $true)][System.Exception]$Exception)
+
+    $current = $Exception
+    while ($current) {
+        $nativeCode = $current.HResult -band 0xFFFF
+        if ($nativeCode -in @(32, 33)) { return $true }
+        $current = $current.InnerException
+    }
+    return $false
+}
+
 function Get-BoundedLogContent {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -624,14 +712,15 @@ function Get-BoundedLogContent {
     )
 
     if (-not (Test-Path $Path -PathType Leaf)) { return "" }
-    $deadline = (Get-Date).AddSeconds($OpenRetrySeconds)
+    $deadline = (Get-LifecycleNow).AddSeconds($OpenRetrySeconds)
     $stream = $null
     while (-not $stream) {
         try {
             $stream = Open-LaunchLogForRead -Path $Path
-        } catch [System.IO.IOException] {
-            if ((Get-Date) -ge $deadline) { throw }
-            Start-Sleep -Milliseconds 100
+        } catch {
+            if (-not (Test-IsSharingViolation -Exception $_.Exception)) { throw }
+            if ((Get-LifecycleNow) -ge $deadline) { throw }
+            Wait-LifecycleRetry -Milliseconds 100
         }
     }
     try {
@@ -664,7 +753,7 @@ function Invoke-LaunchGate {
     try {
         $process = Start-TrackedProcess `
             -FilePath $ExePath `
-            -ArgumentList "--no-tray" `
+            -ArgumentList @("--no-tray") `
             -RedirectStandardOutput $stdoutPath `
             -RedirectStandardError $stderrPath
 

@@ -146,35 +146,63 @@ describe("windows-only CI collectors (self-test)", () => {
 });
 
 describe("required Windows CI topology", () => {
-  const expectedMatrices: Record<string, Array<[string, string, string]>> = {
-    "build-test.yml": [
-      ["windows-latest", "x86_64-pc-windows-msvc", ""],
-      [
-        "windows-11-arm",
-        "aarch64-pc-windows-msvc",
-        "--target aarch64-pc-windows-msvc",
+  const expectedMatrices: Record<string, any> = {
+    "build-test.yml": {
+      include: [
+        {
+          platform: "windows-latest",
+          args: "",
+          target: "x86_64-pc-windows-msvc",
+        },
+        {
+          platform: "windows-11-arm",
+          args: "--target aarch64-pc-windows-msvc",
+          target: "aarch64-pc-windows-msvc",
+        },
       ],
-    ],
-    "pr-test-build.yml": [
-      ["windows-latest", "x86_64-pc-windows-msvc", ""],
-      [
-        "windows-11-arm",
-        "aarch64-pc-windows-msvc",
-        "--target aarch64-pc-windows-msvc",
+    },
+    "pr-test-build.yml": {
+      include: [
+        {
+          platform: "windows-latest",
+          args: "",
+          target: "x86_64-pc-windows-msvc",
+        },
+        {
+          platform: "windows-11-arm",
+          args: "--target aarch64-pc-windows-msvc",
+          target: "aarch64-pc-windows-msvc",
+        },
       ],
-    ],
-    "build-windows.yml": [
-      ["windows-latest", "x86_64-pc-windows-msvc", "--bundles nsis,msi"],
-      [
-        "windows-11-arm",
-        "aarch64-pc-windows-msvc",
-        "--target aarch64-pc-windows-msvc --bundles nsis,msi",
+    },
+    "build-windows.yml": {
+      include: [
+        {
+          platform: "windows-latest",
+          target: "x86_64-pc-windows-msvc",
+          args: "--bundles nsis,msi",
+        },
+        {
+          platform: "windows-11-arm",
+          target: "aarch64-pc-windows-msvc",
+          args: "--target aarch64-pc-windows-msvc --bundles nsis,msi",
+        },
       ],
-    ],
-    "release.yml": [
-      ["windows-latest", "x86_64-pc-windows-msvc", "--bundles nsis,msi"],
-      ["windows-11-arm", "aarch64-pc-windows-msvc", "--bundles nsis,msi"],
-    ],
+    },
+    "release.yml": {
+      include: [
+        {
+          platform: "windows-latest",
+          args: "--bundles nsis,msi",
+          target: "x86_64-pc-windows-msvc",
+        },
+        {
+          platform: "windows-11-arm",
+          args: "--bundles nsis,msi",
+          target: "aarch64-pc-windows-msvc",
+        },
+      ],
+    },
   };
 
   test("discovers exactly the audited build.yml callers", () => {
@@ -198,11 +226,10 @@ describe("required Windows CI topology", () => {
       ) as any[];
       expect(reusableJobs).toHaveLength(1);
       const matrix = reusableJobs[0].strategy.matrix;
-      expect(Object.keys(matrix).sort()).toEqual(["include"]);
-      const include = matrix.include;
-      expect(
-        include.map((entry: any) => [entry.platform, entry.target, entry.args]),
-      ).toEqual(expected);
+      expect(matrix).toEqual(expected);
+      expect(reusableJobs[0].with.platform).toBe("${{ matrix.platform }}");
+      expect(reusableJobs[0].with.target).toBe("${{ matrix.target }}");
+      expect(reusableJobs[0].with["build-args"]).toBe("${{ matrix.args }}");
     });
   }
 

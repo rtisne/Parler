@@ -47,7 +47,7 @@ Describe "Stop-ProductProcesses" {
         $target = [PSCustomObject]@{ Path = $targetPath; Id = 1 }
         $other = [PSCustomObject]@{ Path = $otherPath; Id = 2 }
         $script:processReads = 0
-        Mock Get-Process {
+        Mock Get-NamedProcessCandidates {
             $script:processReads++
             if ($script:processReads -eq 1) { return @($target, $other) }
             return @()
@@ -56,6 +56,28 @@ Describe "Stop-ProductProcesses" {
 
         Stop-ProductProcesses -ExePath $targetPath
         Should -Invoke Stop-ProcessTree -Times 1 -Exactly -ParameterFilter { $Process.Path -eq $targetPath }
+    }
+
+    It "fails when the exact target remains after cleanup" {
+        $targetPath = [System.IO.Path]::GetFullPath((Join-Path ([System.IO.Path]::GetTempPath()) "trusted/parler.exe"))
+        $target = [PSCustomObject]@{ Path = $targetPath; Id = 1 }
+        Mock Get-NamedProcessCandidates { @($target) }
+        Mock Stop-ProcessTree {}
+
+        { Stop-ProductProcesses -ExePath $targetPath } | Should -Throw "*still running*"
+    }
+
+    It "fails closed when process enumeration errors" {
+        Mock Get-NamedProcessCandidates { throw "enumeration denied" }
+        { Stop-ProductProcesses -ExePath "C:\trusted\parler.exe" } | Should -Throw "*enumeration denied*"
+    }
+
+    It "fails closed when a same-name process path cannot be verified" {
+        $candidate = [PSCustomObject]@{ Id = 99 }
+        $candidate | Add-Member -MemberType ScriptProperty -Name Path -Value { throw "path denied" }
+        Mock Get-NamedProcessCandidates { @($candidate) }
+
+        { Stop-ProductProcesses -ExePath "C:\trusted\parler.exe" } | Should -Throw "*Could not verify executable path*"
     }
 }
 
@@ -97,6 +119,29 @@ Describe "Get-UninstallEntries" {
     It "propagates registry provider and access failures" {
         Mock Get-ItemProperty { throw [System.UnauthorizedAccessException]::new("access denied") }
         { Get-UninstallEntries } | Should -Throw "*access denied*"
+    }
+}
+
+Describe "Windows registry provider integration" {
+    It "returns a real HKCU wildcard entry, ignores a missing key, and propagates an invalid drive" -Skip:(-not $IsWindows) {
+        $previousHives = $script:UninstallHives
+        $base = "HKCU:\Software\ParlerLifecycleTests\$([guid]::NewGuid().ToString('N'))"
+        try {
+            $child = New-Item -Path (Join-Path $base "Entry") -Force -ErrorAction Stop
+            New-ItemProperty -Path $child.PSPath -Name DisplayName -Value "Parler Test" -Force -ErrorAction Stop | Out-Null
+
+            $script:UninstallHives = @("$base\*")
+            @(Get-UninstallEntries).DisplayName | Should -Be @("Parler Test")
+
+            $script:UninstallHives = @("$base\Missing\*")
+            @(Get-UninstallEntries).Count | Should -Be 0
+
+            $script:UninstallHives = @("NoSuchRegistryDrive:\*")
+            { Get-UninstallEntries } | Should -Throw
+        } finally {
+            $script:UninstallHives = $previousHives
+            Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction Stop
+        }
     }
 }
 
@@ -148,10 +193,10 @@ Describe "Get-UninstallCommand" {
             $entry = [PSCustomObject]@{ PSChildName = "{12345678-1234-1234-1234-1234567890ab}"; WindowsInstaller = 1 }
             $cmd = Get-UninstallCommand -Entry $entry -InstallerType msi -LogDir $logDir
             $cmd.File | Should -Be "msiexec.exe"
-            $cmd.Args | Should -Match "/x \{12345678-1234-1234-1234-1234567890ab\}"
-            $cmd.Args | Should -Match "/qn"
-            $cmd.Args | Should -Match "/norestart"
-            $cmd.Args | Should -Match "/l\*v"
+            $cmd.Args | Should -Be @(
+                "/x", "{12345678-1234-1234-1234-1234567890ab}", "/qn", "/norestart", "/l*v",
+                (Join-Path $logDir "msi-uninstall.log")
+            )
         } finally {
             Remove-Item -Recurse -Force $logDir -ErrorAction SilentlyContinue
         }
@@ -205,10 +250,16 @@ Describe "Get-UninstallCommand" {
                 InstallLocation = "`"$installDir"
             }
             { Get-UninstallCommand -Entry $entry -InstallerType nsis -LogDir ([System.IO.Path]::GetTempPath()) } |
-                Should -Throw "*missing InstallLocation*"
+                Should -Throw "*unmatched quote*"
         } finally {
             Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
         }
+    }
+
+    It "normalizes whitespace and paired quotes but rejects either unmatched side" {
+        Normalize-RegistryPath -Path '  "C:\Program Files\Parler"  ' | Should -Be "C:\Program Files\Parler"
+        { Normalize-RegistryPath -Path '"C:\Program Files\Parler' } | Should -Throw "*unmatched quote*"
+        { Normalize-RegistryPath -Path 'C:\Program Files\Parler"' } | Should -Throw "*unmatched quote*"
     }
 
     It "parses a trusted QuietUninstallString for NSIS" {
@@ -372,11 +423,99 @@ Describe "Get-BoundedLogContent" {
                 if ($script:openAttempts -eq 1) { throw [System.IO.IOException]::new("file is in use") }
                 return [System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes("startup ok"))
             }
+            Mock Test-IsSharingViolation { $true }
+            Mock Wait-LifecycleRetry {}
 
             Get-BoundedLogContent -Path $path -MaxBytes 16 -OpenRetrySeconds 1 | Should -Be "startup ok"
             Should -Invoke Open-LaunchLogForRead -Times 2 -Exactly
+            Should -Invoke Wait-LifecycleRetry -Times 1 -Exactly
         } finally {
             Remove-Item -LiteralPath (Split-Path -Parent $path) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It "throws immediately when a sharing violation retry deadline is exhausted" {
+        $path = Join-Path (New-TempDir) "locked.log"
+        try {
+            Set-Content -LiteralPath $path -Value "placeholder"
+            $script:clockReads = 0
+            $origin = [datetime]"2026-01-01T00:00:00Z"
+            Mock Get-LifecycleNow {
+                $script:clockReads++
+                if ($script:clockReads -eq 1) { return $origin }
+                return $origin.AddSeconds(2)
+            }
+            Mock Open-LaunchLogForRead { throw [System.IO.IOException]::new("sharing deadline") }
+            Mock Test-IsSharingViolation { $true }
+            Mock Wait-LifecycleRetry {}
+
+            { Get-BoundedLogContent -Path $path -MaxBytes 16 -OpenRetrySeconds 1 } | Should -Throw "*sharing deadline*"
+            Should -Invoke Wait-LifecycleRetry -Times 0 -Exactly
+        } finally {
+            Remove-Item -LiteralPath (Split-Path -Parent $path) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It "does not retry a non-sharing I/O failure" {
+        $path = Join-Path (New-TempDir) "broken.log"
+        try {
+            Set-Content -LiteralPath $path -Value "placeholder"
+            Mock Open-LaunchLogForRead { throw [System.IO.IOException]::new("disk failure") }
+            Mock Test-IsSharingViolation { $false }
+            Mock Wait-LifecycleRetry {}
+
+            { Get-BoundedLogContent -Path $path -MaxBytes 16 -OpenRetrySeconds 5 } | Should -Throw "*disk failure*"
+            Should -Invoke Open-LaunchLogForRead -Times 1 -Exactly
+            Should -Invoke Wait-LifecycleRetry -Times 0 -Exactly
+        } finally {
+            Remove-Item -LiteralPath (Split-Path -Parent $path) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It "disposes the opened stream after reading" {
+        $path = Join-Path (New-TempDir) "stream.log"
+        try {
+            Set-Content -LiteralPath $path -Value "placeholder"
+            $script:openedStream = [System.IO.MemoryStream]::new([System.Text.Encoding]::UTF8.GetBytes("ok"))
+            Mock Open-LaunchLogForRead { return $script:openedStream }
+
+            Get-BoundedLogContent -Path $path -MaxBytes 16 | Should -Be "ok"
+            $script:openedStream.CanRead | Should -BeFalse
+        } finally {
+            Remove-Item -LiteralPath (Split-Path -Parent $path) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    It "retries a real Windows FileShare.None lock until release" -Skip:(-not $IsWindows) {
+        $dir = New-TempDir
+        $job = $null
+        try {
+            $path = Join-Path $dir "native-locked.log"
+            $ready = Join-Path $dir "lock-ready.txt"
+            [System.IO.File]::WriteAllText($path, "native lock released")
+            $job = Start-Job -ArgumentList $path, $ready -ScriptBlock {
+                param($LockedPath, $ReadyPath)
+                $stream = [System.IO.File]::Open($LockedPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+                try {
+                    [System.IO.File]::WriteAllText($ReadyPath, "ready")
+                    Start-Sleep -Milliseconds 750
+                } finally { $stream.Dispose() }
+            }
+            $deadline = (Get-Date).AddSeconds(10)
+            while (-not (Test-Path -LiteralPath $ready) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 50 }
+            Test-Path -LiteralPath $ready | Should -BeTrue
+
+            Get-BoundedLogContent -Path $path -MaxBytes 64 -OpenRetrySeconds 5 | Should -Be "native lock released"
+            Wait-Job -Job $job -Timeout 10 | Should -Not -BeNullOrEmpty
+            Receive-Job -Job $job -ErrorAction Stop | Out-Null
+            Remove-Job -Job $job -Force
+            $job = $null
+        } finally {
+            if ($job) {
+                Stop-Job -Job $job -ErrorAction Stop
+                Remove-Job -Job $job -Force
+            }
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction Stop
         }
     }
 
@@ -406,22 +545,33 @@ Describe "Get-BoundedLogContent" {
 Describe "Windows Job Object ownership" {
     It "reports assignment, job cleanup, process kill, and liveness failures together" {
         $fake = New-FakeProcess -Completes $false
-        $fake | Add-Member -MemberType ScriptMethod -Name Kill -Force -Value { throw "kill denied" }
-        Mock New-ProcessJobHandle { [IntPtr]123 }
+        $script:killAttempts = 0
+        $fake | Add-Member -MemberType ScriptMethod -Name Kill -Force -Value {
+            $script:killAttempts++
+            throw "kill denied"
+        }
+        $job = [PSCustomObject]@{ IsClosed = $false; IsInvalid = $false }
+        Mock New-ProcessJobHandle { $job }
         Mock Add-ProcessToJob { throw "assignment denied" }
         Mock Stop-NativeProcessJob { throw "job cleanup denied" }
 
         { Register-ProcessJob -Process $fake -ForceWindowsSemantics } |
             Should -Throw "*assignment denied*job cleanup denied*kill denied*still running*"
+        Should -Invoke New-ProcessJobHandle -Times 1 -Exactly
+        Should -Invoke Add-ProcessToJob -Times 1 -Exactly -ParameterFilter { $JobHandle -eq $job -and $ProcessId -eq $fake.Id }
+        Should -Invoke Stop-NativeProcessJob -Times 1 -Exactly -ParameterFilter { $JobHandle -eq $job }
+        $script:killAttempts | Should -Be 1
     }
 
-    It "invalidates handle ownership before native termination" {
+    It "relinquishes SafeHandle ownership before native termination" {
         $fake = New-FakeProcess -Completes $true
-        $fake | Add-Member -MemberType NoteProperty -Name ParlerJobHandle -Value ([IntPtr]123) -Force
+        $handle = [PSCustomObject]@{ IsClosed = $false; IsInvalid = $false }
+        $fake | Add-Member -MemberType NoteProperty -Name ParlerJobHandle -Value $handle -Force
         Mock Stop-NativeProcessJob { throw "terminate failed" }
 
         { Stop-ProcessTree -Process $fake } | Should -Throw "*terminate failed*"
-        $fake.ParlerJobHandle | Should -Be ([IntPtr]::Zero)
+        $fake.ParlerJobHandle | Should -BeNullOrEmpty
+        Should -Invoke Stop-NativeProcessJob -Times 1 -Exactly -ParameterFilter { $JobHandle -eq $handle }
     }
 }
 
@@ -458,6 +608,81 @@ Describe "Invoke-BoundedProcess" {
     }
 }
 
+Describe "Windows Job Object handshake integration" {
+    It "does not launch the payload and cleans wrapper state when assignment fails" -Skip:(-not $IsWindows) {
+        $root = New-TempDir
+        $previousRunnerTemp = $env:RUNNER_TEMP
+        $script:assignmentWrapper = $null
+        try {
+            $env:RUNNER_TEMP = $root
+            $marker = Join-Path $root "payload-started.txt"
+            $payloadScript = Join-Path $root "marker payload.ps1"
+            Set-Content -LiteralPath $payloadScript -Value "Set-Content -LiteralPath '$($marker.Replace("'", "''"))' -Value started"
+            $rejectAssignment = {
+                param($Process)
+                $script:assignmentWrapper = $Process
+                throw "injected assignment failure"
+            }
+
+            { Start-TrackedProcess -FilePath "pwsh" -ArgumentList @("-NoProfile", "-File", $payloadScript) -RegisterProcess $rejectAssignment } |
+                Should -Throw "*injected assignment failure*"
+            $script:assignmentWrapper | Should -Not -BeNullOrEmpty
+            $script:assignmentWrapper.WaitForExit(5000) | Should -BeTrue
+            Test-Path -LiteralPath $marker | Should -BeFalse
+            @(Get-ChildItem -LiteralPath $root -Directory -Filter "parler-process-*" -ErrorAction Stop).Count | Should -Be 0
+        } finally {
+            if ($script:assignmentWrapper -and -not $script:assignmentWrapper.HasExited) {
+                $script:assignmentWrapper.Kill($true)
+                $script:assignmentWrapper.WaitForExit(5000) | Out-Null
+            }
+            $env:RUNNER_TEMP = $previousRunnerTemp
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction Stop
+        }
+    }
+}
+
+Describe "Windows wrapper argument and redirection integration" {
+    It "preserves argument boundaries, redirects both logs, and propagates exit code" -Skip:(-not $IsWindows) {
+        $dir = New-TempDir
+        $process = $null
+        try {
+            $scriptFile = Join-Path $dir "argument payload.ps1"
+            $resultFile = Join-Path $dir "captured arguments.json"
+            $stdoutFile = Join-Path $dir "wrapper stdout.log"
+            $stderrFile = Join-Path $dir "wrapper stderr.log"
+            Set-Content -LiteralPath $scriptFile -Value @'
+param(
+    [Parameter(Mandatory = $true)][string]$OutputPath,
+    [Parameter(ValueFromRemainingArguments = $true)][AllowEmptyString()][string[]]$Captured
+)
+@($Captured) | ConvertTo-Json -Compress | Set-Content -LiteralPath $OutputPath
+Write-Output "stdout marker"
+[Console]::Error.WriteLine("stderr marker")
+exit 7
+'@
+            $expected = @("value with spaces", 'embedded"quote', "")
+            $process = Start-TrackedProcess -FilePath "pwsh" -ArgumentList (@(
+                "-NoProfile", "-File", $scriptFile, $resultFile
+            ) + $expected) -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+            $tempDir = [string]$process.ParlerProcessTempDir
+
+            $process.WaitForExit(30000) | Should -BeTrue
+            $process.Refresh()
+            $process.ExitCode | Should -Be 7
+            @((Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json)) | Should -Be $expected
+            Get-Content -LiteralPath $stdoutFile -Raw | Should -Match "stdout marker"
+            Get-Content -LiteralPath $stderrFile -Raw | Should -Match "stderr marker"
+
+            Stop-ProcessTree -Process $process
+            $process = $null
+            Test-Path -LiteralPath $tempDir | Should -BeFalse
+        } finally {
+            if ($process) { Stop-ProcessTree -Process $process }
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction Stop
+        }
+    }
+}
+
 Describe "Windows Job Object process-tree integration" {
     It "terminates a child after its tracked parent has already exited" -Skip:(-not $IsWindows) {
         $dir = New-TempDir
@@ -473,24 +698,29 @@ Set-Content -LiteralPath '__PID_FILE__' -Value $child.Id
             $scriptText = $scriptText.Replace('__PID_FILE__', $pidFile.Replace("'", "''"))
             Set-Content -LiteralPath $scriptFile -Value $scriptText
 
-            $parentArguments = "-NoProfile -File `"$scriptFile`""
+            $parentArguments = @("-NoProfile", "-File", $scriptFile)
             $parent = Start-TrackedProcess -FilePath pwsh -ArgumentList $parentArguments
-            $parent.WaitForExit(10000) | Should -BeTrue
+            $parent.WaitForExit(30000) | Should -BeTrue
 
-            $deadline = (Get-Date).AddSeconds(10)
+            $deadline = (Get-Date).AddSeconds(30)
             while (-not (Test-Path $pidFile) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
             Test-Path $pidFile | Should -BeTrue
             $childId = [int](Get-Content $pidFile -Raw)
             Get-Process -Id $childId -ErrorAction Stop | Should -Not -BeNullOrEmpty
 
+            $tempDir = [string]$parent.ParlerProcessTempDir
             Stop-ProcessTree -Process $parent
-            $deadline = (Get-Date).AddSeconds(5)
+            $parent = $null
+            $deadline = (Get-Date).AddSeconds(30)
             while ((Get-Process -Id $childId -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
             Get-Process -Id $childId -ErrorAction SilentlyContinue | Should -BeNullOrEmpty
+            Test-Path -LiteralPath $tempDir | Should -BeFalse
         } finally {
-            if ($parent) { try { Stop-ProcessTree -Process $parent } catch { } }
-            if ($childId) { Stop-Process -Id $childId -Force -ErrorAction SilentlyContinue }
-            Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+            if ($parent) { Stop-ProcessTree -Process $parent }
+            if ($childId -and (Get-Process -Id $childId -ErrorAction SilentlyContinue)) {
+                Stop-Process -Id $childId -Force -ErrorAction Stop
+            }
+            Remove-Item -Recurse -Force $dir -ErrorAction Stop
         }
     }
 }

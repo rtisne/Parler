@@ -15,19 +15,51 @@ while (-not (Test-Path -LiteralPath $ReadyPath -PathType Leaf)) {
 }
 
 $payload = Get-Content -LiteralPath $PayloadPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-$start = @{
-    FilePath = [string]$payload.FilePath
-    ArgumentList = [string]$payload.ArgumentList
-    PassThru = $true
-}
-if ($payload.RedirectStandardOutput) {
-    $start.RedirectStandardOutput = [string]$payload.RedirectStandardOutput
-}
-if ($payload.RedirectStandardError) {
-    $start.RedirectStandardError = [string]$payload.RedirectStandardError
+$startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+$startInfo.FileName = [string]$payload.FilePath
+$startInfo.UseShellExecute = $false
+foreach ($argument in @($payload.ArgumentList)) {
+    $startInfo.ArgumentList.Add([string]$argument)
 }
 
-$child = Start-Process @start
-$child.WaitForExit()
-$child.Refresh()
-exit $child.ExitCode
+$stdoutStream = $null
+$stderrStream = $null
+$child = $null
+$copyTasks = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
+try {
+    if ($payload.RedirectStandardOutput) {
+        $startInfo.RedirectStandardOutput = $true
+        $stdoutStream = [System.IO.File]::Open(
+            [string]$payload.RedirectStandardOutput,
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::Read
+        )
+    }
+    if ($payload.RedirectStandardError) {
+        $startInfo.RedirectStandardError = $true
+        $stderrStream = [System.IO.File]::Open(
+            [string]$payload.RedirectStandardError,
+            [System.IO.FileMode]::Create,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::Read
+        )
+    }
+
+    $child = [System.Diagnostics.Process]::Start($startInfo)
+    if ($stdoutStream) { $copyTasks.Add($child.StandardOutput.BaseStream.CopyToAsync($stdoutStream)) }
+    if ($stderrStream) { $copyTasks.Add($child.StandardError.BaseStream.CopyToAsync($stderrStream)) }
+
+    $child.WaitForExit()
+    if ($copyTasks.Count -gt 0) {
+        [System.Threading.Tasks.Task]::WhenAll($copyTasks).GetAwaiter().GetResult()
+    }
+    $child.Refresh()
+    $exitCode = $child.ExitCode
+} finally {
+    if ($child) { $child.Dispose() }
+    if ($stdoutStream) { $stdoutStream.Dispose() }
+    if ($stderrStream) { $stderrStream.Dispose() }
+}
+
+exit $exitCode
