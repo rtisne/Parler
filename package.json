@@ -19,7 +19,7 @@
     "test:playwright": "playwright test",
     "test:playwright:ui": "playwright test --ui",
     "test:translations": "bun test scripts/check-translations.test.ts",
-    "test:build-config": "bun test scripts/updater-build-config.test.ts",
+    "test:build-config": "bun test scripts/updater-build-config.test.ts scripts/vite-build.test.ts",
     "check:translations": "bun scripts/check-translations.ts"
   },
   "dependencies": {
