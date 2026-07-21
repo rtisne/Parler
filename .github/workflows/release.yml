@@ -2,6 +2,10 @@ name: "Release"
 
 on: workflow_dispatch
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   create-release:
     permissions:
@@ -10,6 +14,7 @@ jobs:
     outputs:
       release-id: ${{ steps.create-release.outputs.result }}
       version: ${{ steps.get-version.outputs.version }}
+      source-sha: ${{ github.sha }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -22,39 +27,85 @@ jobs:
           echo "Application version from tauri.conf.json: $VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Verify version consistency
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ steps.get-version.outputs.version }}
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const expected = process.env.EXPECTED_VERSION;
+          const packageVersion = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
+          const cargo = fs.readFileSync("src-tauri/Cargo.toml", "utf8");
+          const cargoVersion = cargo.match(/^version = "([^"]+)"$/m)?.[1];
+          const lock = fs.readFileSync("src-tauri/Cargo.lock", "utf8");
+          const lockVersion = lock.match(
+            /\[\[package\]\]\nname = "parler"\nversion = "([^"]+)"/,
+          )?.[1];
+          if (
+            !expected ||
+            packageVersion !== expected ||
+            cargoVersion !== expected ||
+            lockVersion !== expected
+          ) {
+            throw new Error(
+              `Version mismatch: tauri=${expected}, package=${packageVersion}, cargo=${cargoVersion}, lock=${lockVersion}`,
+            );
+          }
+          console.log(`Version consistency verified: ${expected}`);
+          NODE
+
       - name: Create Draft Release
         id: create-release
         uses: actions/github-script@v7
+        env:
+          RELEASE_VERSION: ${{ steps.get-version.outputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
         with:
           script: |
-            const tag = `v${{ steps.get-version.outputs.version }}`;
+            const tag = `v${process.env.RELEASE_VERSION}`;
+            const sourceSha = process.env.SOURCE_SHA;
 
-            // Clean up any existing release for this tag (from a previous run)
-            try {
-              const existing = await github.rest.repos.getReleaseByTag({
+            if (!sourceSha || !/^[0-9a-f]{40}$/.test(sourceSha)) {
+              core.setFailed(`Invalid source SHA: ${sourceSha}`);
+              return;
+            }
+
+            // A rerun may replace an unfinished draft, but must never rewrite a
+            // published release or its immutable tag.
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                tag: tag
-              });
-              console.log(`Found existing release (id: ${existing.data.id}, draft: ${existing.data.draft}). Deleting it...`);
+                per_page: 100
+              }
+            );
+            const existing = releases.find(release => release.tag_name === tag);
+            if (existing) {
+              if (!existing.draft) {
+                core.setFailed(`Release ${tag} is already published; refusing to replace it.`);
+                return;
+              }
+              console.log(`Found existing draft release (id: ${existing.id}). Deleting the draft...`);
               await github.rest.repos.deleteRelease({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                release_id: existing.data.id
+                release_id: existing.id
               });
-            } catch (e) {
-              if (e.status !== 404) throw e;
+            } else {
               console.log('No existing release found for this tag.');
             }
 
-            // Clean up any existing git tag (left over from a previous release)
+            // A pre-existing tag is never deleted automatically.
             try {
-              await github.rest.git.deleteRef({
+              await github.rest.git.getRef({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 ref: `tags/${tag}`
               });
-              console.log(`Deleted existing tag ${tag}`);
+              core.setFailed(`Tag ${tag} already exists; refusing to rewrite it.`);
+              return;
             } catch (e) {
               if (e.status !== 404 && e.status !== 422) throw e;
               console.log('No existing tag to delete.');
@@ -64,7 +115,9 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               tag_name: tag,
+              target_commitish: sourceSha,
               name: tag,
+              body: 'Windows x64 and ARM64 installers. Code signing and automatic updater artifacts are intentionally disabled until fork-owned signing credentials are configured.',
               draft: true,
               prerelease: false,
               generate_release_notes: true
@@ -83,17 +136,22 @@ jobs:
             args: "--bundles nsis,msi"
             target: "x86_64-pc-windows-msvc"
             apple_signing: false
+          - platform: "windows-11-arm" # Windows ARM64
+            args: "--bundles nsis,msi"
+            target: "aarch64-pc-windows-msvc"
+            apple_signing: false
 
     uses: ./.github/workflows/build.yml
     with:
       platform: ${{ matrix.platform }}
       target: ${{ matrix.target }}
       build-args: ${{ matrix.args }}
-      sign-binaries: true
+      sign-binaries: false
       apple_signing: ${{ matrix.apple_signing }}
       asset-prefix: "parler"
       upload-artifacts: false
       release-id: ${{ needs.create-release.outputs.release-id }}
+      ref: ${{ needs.create-release.outputs.source-sha }}
     secrets: inherit
 
   publish-release:
@@ -101,7 +159,7 @@ jobs:
       contents: write
     runs-on: ubuntu-latest
     needs: [create-release, publish-tauri]
-    if: ${{ !cancelled() && needs.create-release.result == 'success' }}
+    if: ${{ !cancelled() && needs.create-release.result == 'success' && needs.publish-tauri.result == 'success' }}
     steps:
       - name: Publish Release
         uses: actions/github-script@v7
