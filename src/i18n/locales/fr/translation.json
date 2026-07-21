@@ -522,6 +522,7 @@
     "upToDate": "À jour",
     "downloadUpdate": "Télécharger la mise à jour",
     "restart": "Redémarrer",
+    "updateCheckingUnavailable": "Mises à jour automatiques non configurées pour cette version",
     "updateCheckingDisabled": "Vérification des mises à jour désactivée",
     "downloading": "Téléchargement... {{progress}}%",
     "installing": "Installation...",

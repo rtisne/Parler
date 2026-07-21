@@ -5,6 +5,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { listen } from "@tauri-apps/api/event";
 import { ProgressBar } from "../shared";
 import { useSettings } from "../../hooks/useSettings";
+import { useUpdaterAvailability } from "../../hooks/useUpdaterAvailability";
 
 interface UpdateCheckerProps {
   className?: string;
@@ -20,8 +21,14 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
   const [showUpToDate, setShowUpToDate] = useState(false);
 
   const { settings, isLoading } = useSettings();
+  const {
+    isConfigured: updaterConfigured,
+    isLoading: isUpdaterAvailabilityLoading,
+  } = useUpdaterAvailability();
   const settingsLoaded = !isLoading && settings !== null;
-  const updateChecksEnabled = settings?.update_checks_enabled ?? false;
+  const updaterAvailabilityLoaded = !isUpdaterAvailabilityLoading;
+  const updateChecksEnabled =
+    updaterConfigured && (settings?.update_checks_enabled ?? false);
 
   const upToDateTimeoutRef = useRef<ReturnType<typeof setTimeout>>();
   const isManualCheckRef = useRef(false);
@@ -29,8 +36,9 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
   const contentLengthRef = useRef(0);
 
   useEffect(() => {
-    // Wait for settings to load before doing anything
-    if (!settingsLoaded) return;
+    // Stay fail-closed until both settings and the effective backend updater
+    // configuration have loaded.
+    if (!settingsLoaded || !updaterAvailabilityLoaded) return;
 
     if (!updateChecksEnabled) {
       if (upToDateTimeoutRef.current) {
@@ -55,7 +63,7 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
       }
       updateUnlisten.then((fn) => fn());
     };
-  }, [settingsLoaded, updateChecksEnabled]);
+  }, [settingsLoaded, updaterAvailabilityLoaded, updateChecksEnabled]);
 
   // Update checking functions
   const checkForUpdates = async () => {
@@ -141,6 +149,9 @@ const UpdateChecker: React.FC<UpdateCheckerProps> = ({ className = "" }) => {
 
   // Update status functions
   const getUpdateStatusText = () => {
+    if (!updaterAvailabilityLoaded || !updaterConfigured) {
+      return t("footer.updateCheckingUnavailable");
+    }
     if (!updateChecksEnabled) {
       return t("footer.updateCheckingDisabled");
     }

@@ -511,6 +511,7 @@
     "upToDate": "Actualizado",
     "downloadUpdate": "Descargar Actualización",
     "restart": "Reiniciar",
+    "updateCheckingUnavailable": "Actualizaciones automáticas no configuradas para esta versión",
     "updateCheckingDisabled": "Búsqueda de Actualizaciones Deshabilitada",
     "downloading": "Descargando... {{progress}}%",
     "installing": "Instalando...",

@@ -502,6 +502,7 @@
     "upToDate": "최신 상태",
     "downloadUpdate": "업데이트 다운로드",
     "restart": "재시작",
+    "updateCheckingUnavailable": "이 빌드에는 자동 업데이트가 구성되어 있지 않습니다",
     "updateCheckingDisabled": "업데이트 확인 비활성화됨",
     "downloading": "다운로드 중... {{progress}}%",
     "installing": "설치 중...",

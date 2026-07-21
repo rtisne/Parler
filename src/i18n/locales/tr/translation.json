@@ -502,6 +502,7 @@
     "upToDate": "Güncel",
     "downloadUpdate": "Güncellemeyi İndir",
     "restart": "Yeniden Başlat",
+    "updateCheckingUnavailable": "Bu sürüm için otomatik güncellemeler yapılandırılmadı",
     "updateCheckingDisabled": "Güncelleme Kontrolü Devre Dışı",
     "downloading": "İndiriliyor... %{{progress}}",
     "installing": "Yükleniyor...",

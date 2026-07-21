@@ -502,6 +502,7 @@
     "upToDate": "Vše aktuální",
     "downloadUpdate": "Stáhnout aktualizaci",
     "restart": "Restartovat",
+    "updateCheckingUnavailable": "Automatické aktualizace nejsou pro tuto verzi nakonfigurovány",
     "updateCheckingDisabled": "Kontrola aktualizací vypnuta",
     "downloading": "Stahování... {{progress}}%",
     "installing": "Instalace...",

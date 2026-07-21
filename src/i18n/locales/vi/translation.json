@@ -511,6 +511,7 @@
     "upToDate": "Đã cập nhật",
     "downloadUpdate": "Tải cập nhật",
     "restart": "Khởi động lại",
+    "updateCheckingUnavailable": "Cập nhật tự động chưa được cấu hình cho bản dựng này",
     "updateCheckingDisabled": "Đã tắt kiểm tra cập nhật",
     "downloading": "Đang tải... {{progress}}%",
     "installing": "Đang cài đặt...",

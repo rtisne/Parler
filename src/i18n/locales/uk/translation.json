@@ -502,6 +502,7 @@
     "upToDate": "Актуальна версія",
     "downloadUpdate": "Завантажити оновлення",
     "restart": "Перезапустити",
+    "updateCheckingUnavailable": "Автоматичні оновлення не налаштовані для цієї збірки",
     "updateCheckingDisabled": "Перевірка оновлень вимкнена",
     "downloading": "Завантаження... {{progress}}%",
     "installing": "Встановлення...",
