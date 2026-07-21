@@ -19,6 +19,10 @@ jobs:
         shell: pwsh
         run: ./.github/scripts/setup-openblas.ps1 -Target "x86_64-pc-windows-msvc"
 
+      - name: Install pkg-config (Windows x64)
+        shell: pwsh
+        run: ./.github/scripts/setup-pkgconf.ps1 -Target "x86_64-pc-windows-msvc"
+
       - name: Use mock TranscriptionManager (CI only)
         shell: bash
         working-directory: src-tauri
