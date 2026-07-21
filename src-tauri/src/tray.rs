@@ -112,7 +112,7 @@ pub fn update_tray_menu(app: &AppHandle, state: &TrayIconState, locale: Option<&
         app,
         "check_updates",
         &strings.check_updates,
-        settings.update_checks_enabled,
+        crate::updater_configured(app) && settings.update_checks_enabled,
         None::<&str>,
     )
     .expect("failed to create check updates item");

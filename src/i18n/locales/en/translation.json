@@ -632,6 +632,7 @@
     "upToDate": "Up to date",
     "downloadUpdate": "Download Update",
     "restart": "Restart",
+    "updateCheckingUnavailable": "Automatic updates not configured for this build",
     "updateCheckingDisabled": "Update Checking Disabled",
     "downloading": "Downloading... {{progress}}%",
     "installing": "Installing...",

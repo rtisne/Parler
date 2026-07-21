@@ -433,6 +433,9 @@ async stopHandyKeysRecording() : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async isUpdaterConfigured() : Promise<boolean> {
+    return await TAURI_INVOKE("is_updater_configured");
+},
 async triggerUpdateCheck() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("trigger_update_check") };

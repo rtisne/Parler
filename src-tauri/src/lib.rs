@@ -183,7 +183,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
             }
             "check_updates" => {
                 let settings = settings::get_settings(app);
-                if settings.update_checks_enabled {
+                if updater_configured(app) && settings.update_checks_enabled {
                     show_main_window(app);
                     let _ = app.emit("check-for-updates", ());
                 }
@@ -274,9 +274,64 @@ fn shutdown_core_logic(app_handle: &AppHandle, reason: &str) {
     log::info!("App shutdown cleanup complete");
 }
 
+fn updater_configured_from_plugins(plugins: &tauri::utils::config::PluginConfig) -> bool {
+    plugins
+        .0
+        .get("updater")
+        .and_then(|updater| updater.get("endpoints"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|endpoints| !endpoints.is_empty())
+}
+
+fn updater_configured(app: &AppHandle) -> bool {
+    updater_configured_from_plugins(&app.config().plugins)
+}
+
+#[tauri::command]
+#[specta::specta]
+fn is_updater_configured(app: AppHandle) -> bool {
+    updater_configured(&app)
+}
+
+#[cfg(test)]
+mod updater_configuration_tests {
+    use super::updater_configured_from_plugins;
+    use serde_json::json;
+    use tauri::utils::config::PluginConfig;
+
+    #[test]
+    fn missing_updater_configuration_is_unavailable() {
+        assert!(!updater_configured_from_plugins(&PluginConfig::default()));
+    }
+
+    #[test]
+    fn empty_updater_endpoints_are_unavailable() {
+        let mut plugins = PluginConfig::default();
+        plugins
+            .0
+            .insert("updater".into(), json!({ "endpoints": [] }));
+
+        assert!(!updater_configured_from_plugins(&plugins));
+    }
+
+    #[test]
+    fn non_empty_updater_endpoints_are_available() {
+        let mut plugins = PluginConfig::default();
+        plugins.0.insert(
+            "updater".into(),
+            json!({ "endpoints": ["https://example.invalid/latest.json"] }),
+        );
+
+        assert!(updater_configured_from_plugins(&plugins));
+    }
+}
+
 #[tauri::command]
 #[specta::specta]
 fn trigger_update_check(app: AppHandle) -> Result<(), String> {
+    if !updater_configured(&app) {
+        return Ok(());
+    }
     let settings = settings::get_settings(&app);
     if !settings.update_checks_enabled {
         return Ok(());
@@ -345,6 +400,7 @@ pub fn run(cli_args: CliArgs) {
         shortcut::change_preload_model_setting,
         shortcut::handy_keys::start_handy_keys_recording,
         shortcut::handy_keys::stop_handy_keys_recording,
+        is_updater_configured,
         trigger_update_check,
         commands::cancel_operation,
         commands::toggle_pause,

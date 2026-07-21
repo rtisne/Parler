@@ -502,6 +502,7 @@
     "upToDate": "最新です",
     "downloadUpdate": "アップデートをダウンロード",
     "restart": "再起動",
+    "updateCheckingUnavailable": "このビルドでは自動更新が設定されていません",
     "updateCheckingDisabled": "アップデート確認無効",
     "downloading": "ダウンロード中... {{progress}}%",
     "installing": "インストール中...",

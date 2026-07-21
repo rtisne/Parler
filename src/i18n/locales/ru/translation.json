@@ -502,6 +502,7 @@
     "upToDate": "Не требует обновлений",
     "downloadUpdate": "Скачать обновление",
     "restart": "Перезапуск",
+    "updateCheckingUnavailable": "Автоматические обновления не настроены для этой сборки",
     "updateCheckingDisabled": "Проверка обновлений отключена",
     "downloading": "Загрузка... {{progress}} %",
     "installing": "Установка...",
