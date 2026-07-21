@@ -41,6 +41,9 @@ reintroduces:
   reference macOS or Linux;
 - a reusable-call `with.platform`/`with.target` that is not Windows, or an
   expression that cannot be traced to a validated matrix value;
+- any job-level reusable workflow other than the audited local
+  `./.github/workflows/build.yml`; the exact x64/ARM64 runner, target and argument
+  matrices are also asserted for every installer-producing workflow;
 - a step whose `uses`/`run`/`if`/`env`/`with` **value** contains a macOS/Linux token
   (`apt-get`, `ubuntu`, `macos`, `APPLE_CERTIFICATE`, `apple-darwin`,
   `unknown-linux-gnu`, `appimage`, `.deb`, `.rpm`, `.dmg`, `fuse`).
@@ -58,23 +61,32 @@ NSIS it performs:
    `bundle/nsis/*-setup.exe` (ambiguity → fail).
 2. **Bounded silent install** — `msiexec /i … /qn` (MSI, per-machine → HKLM)
    or the uppercase `/S` NSIS switch (per-user → `%LOCALAPPDATA%\Parler`, HKCU).
-   A hung installer is terminated with its process tree.
+   A pre-install registry snapshot prevents a stale same-name entry from being
+   selected. Every launched process is assigned to a Windows Job Object with
+   kill-on-close, so descendants are terminated even after the root exits.
 3. **Resolve the installed exe** from the uninstall-registry metadata
    (`DisplayName -eq 'Parler'` across all four HKLM/HKCU + WOW6432Node hives),
-   via `InstallLocation` with an exact-filename `DisplayIcon` fallback. MSI
-   entries must be Windows Installer entries with a valid ProductCode GUID.
+   via `InstallLocation` with an exact-filename `DisplayIcon` fallback that must
+   remain under a declared install root. MSI
+   entries must be Windows Installer entries with a valid ProductCode GUID. The
+   selected entry must be newly created and carries its exact registry `PSPath`.
+   An NSIS uninstaller must exist as `uninstall.exe` below the validated
+   `InstallLocation`; arbitrary registry-provided executables are rejected.
 4. **Bounded launch survival** — launch `parler.exe --no-tray`, keep it alive
    for a fixed window, scan stderr for startup panics, enforce a 10 MiB log
-   safety limit, then force-kill the process tree and confirm the product
-   process is gone.
+   safety limit, then terminate the Job Object before the final bounded file
+   reads and confirm the product process is gone.
 5. **Real silent uninstall** — `msiexec /x {ProductCode}` or the NSIS
    `QuietUninstallString`/`UninstallString` (with `/S`). Because an NSIS
    uninstaller detaches a `%TEMP%` copy and returns early, completion is
    confirmed with a bounded process wait and poll (up to 120 s) until both the
-   registry entry and the executable are gone. Failure paths run the same
-   uninstall cleanup in `finally`.
-6. **Residue verification** — the install directory must be removed or empty;
-   any remaining file or directory fails the gate.
+   exact selected registry key (`PSPath`) and the executable are gone. An
+   unrelated same-name entry cannot affect the result. Failure paths either run
+   the same uninstall cleanup in `finally` or report explicitly that safe entry
+   discovery was impossible.
+6. **Residue verification** — the full registry `InstallLocation` must be
+   removed or empty; any remaining file/directory or traversal error fails the
+   gate.
 
 On failure, MSI logs and the app's stdout/stderr (isolated per installer type)
 are uploaded as the
@@ -90,6 +102,7 @@ construction, exe resolution, residue assertion) is covered by
 The lifecycle steps live **inside the `build` job** of the reusable
 `build.yml`, so a failure fails that job. The manual `build-windows.yml` also
 delegates both architectures to `build.yml` and has no publication job. In
+addition it has read-only contents permission and inherits no secrets. In
 `release.yml`, `publish-release`
 requires `needs.publish-tauri.result == 'success'`, and `publish-tauri` is the
 matrix that calls `build.yml`. A lifecycle failure on either architecture

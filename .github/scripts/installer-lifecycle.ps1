@@ -39,8 +39,129 @@ function Test-MsiProductCode {
     return [guid]::TryParse($ProductCode, [ref]$guid)
 }
 
+function Initialize-ProcessJobApi {
+    if (-not $IsWindows -or ("ParlerProcessJob" -as [type])) { return }
+
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+public static class ParlerProcessJob
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount, WriteOperationCount, OtherOperationCount;
+        public ulong ReadTransferCount, WriteTransferCount, OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit, PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize, MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass, SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit, JobMemoryLimit, PeakProcessMemoryUsed, PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(IntPtr job, int infoClass, IntPtr info, uint length);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public static IntPtr CreateKillOnClose()
+    {
+        IntPtr job = CreateJobObject(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        info.BasicLimitInformation.LimitFlags = 0x00002000; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        int size = Marshal.SizeOf(info);
+        IntPtr pointer = Marshal.AllocHGlobal(size);
+        try
+        {
+            Marshal.StructureToPtr(info, pointer, false);
+            if (!SetInformationJobObject(job, 9, pointer, (uint)size))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return job;
+        }
+        catch
+        {
+            CloseHandle(job);
+            throw;
+        }
+        finally { Marshal.FreeHGlobal(pointer); }
+    }
+
+    public static void Assign(IntPtr job, int processId)
+    {
+        using (Process process = Process.GetProcessById(processId))
+        {
+            if (!AssignProcessToJobObject(job, process.Handle))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+
+    public static void TerminateAndClose(IntPtr job)
+    {
+        try
+        {
+            if (!TerminateJobObject(job, 1))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+        finally { CloseHandle(job); }
+    }
+}
+'@
+}
+
+function Register-ProcessJob {
+    param([Parameter(Mandatory = $true)]$Process)
+
+    if (-not $IsWindows) { return $Process }
+    Initialize-ProcessJobApi
+    $job = [ParlerProcessJob]::CreateKillOnClose()
+    try {
+        [ParlerProcessJob]::Assign($job, $Process.Id)
+        $Process | Add-Member -MemberType NoteProperty -Name ParlerJobHandle -Value $job -Force
+        return $Process
+    } catch {
+        try { [ParlerProcessJob]::TerminateAndClose($job) } catch { }
+        try { $Process.Kill($true) } catch { }
+        throw "Could not place process $($Process.Id) in a kill-on-close Windows Job Object: $($_.Exception.Message)"
+    }
+}
+
 function Stop-ProcessTree {
     param([Parameter(Mandatory = $true)]$Process)
+
+    $jobProperty = $Process.PSObject.Properties["ParlerJobHandle"]
+    if ($jobProperty -and [IntPtr]$jobProperty.Value -ne [IntPtr]::Zero) {
+        $jobHandle = [IntPtr]$jobProperty.Value
+        try {
+            [ParlerProcessJob]::TerminateAndClose($jobHandle)
+            $Process.ParlerJobHandle = [IntPtr]::Zero
+        } catch {
+            throw "Windows Job Object cleanup failed for process $($Process.Id): $($_.Exception.Message)"
+        }
+    }
 
     try { $Process.Refresh() } catch { }
     if ($Process.HasExited) { return }
@@ -63,8 +184,17 @@ function Invoke-BoundedProcess {
         [Parameter(Mandatory = $true)][string]$Description
     )
 
-    $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+    $process = Register-ProcessJob -Process (Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -PassThru)
+    try {
+        $completed = $process.WaitForExit($TimeoutSeconds * 1000)
+    } catch {
+        $waitError = $_.Exception.Message
+        try { Stop-ProcessTree -Process $process } catch {
+            throw "$Description wait failed: $waitError; process cleanup also failed: $($_.Exception.Message)"
+        }
+        throw "$Description wait failed: $waitError"
+    }
+    if (-not $completed) {
         Stop-ProcessTree -Process $process
         throw "$Description timed out after $TimeoutSeconds seconds and was terminated."
     }
@@ -110,19 +240,42 @@ function Get-UninstallEntries {
     return @($entries)
 }
 
-function Select-UninstallEntry {
+function Get-UninstallEntryIdentity {
+    param([Parameter(Mandatory = $true)]$Entry)
+
+    $identity = [string]$Entry.PSPath
+    if ([string]::IsNullOrWhiteSpace($identity)) {
+        throw "Uninstall metadata is missing the exact registry PSPath identity."
+    }
+    return $identity
+}
+
+function Test-TypedUninstallEntry {
     param(
-        [Parameter(Mandatory = $true)]$Entries,
+        [Parameter(Mandatory = $true)]$Entry,
         [Parameter(Mandatory = $true)][string]$ProductName,
         [Parameter(Mandatory = $true)][ValidateSet("msi", "nsis")][string]$InstallerType
     )
 
+    if ($Entry.DisplayName -ne $ProductName) { return $false }
+    if ($InstallerType -eq "msi") {
+        return ([int]$Entry.WindowsInstaller -eq 1) -and (Test-MsiProductCode -ProductCode ([string]$Entry.PSChildName))
+    }
+    return [int]$Entry.WindowsInstaller -ne 1
+}
+
+function Select-UninstallEntry {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()]$Entries,
+        [Parameter(Mandatory = $true)][string]$ProductName,
+        [Parameter(Mandatory = $true)][ValidateSet("msi", "nsis")][string]$InstallerType,
+        [string[]]$ExcludedIdentities = @()
+    )
+
     $matched = @($Entries | Where-Object {
-        if ($_.DisplayName -ne $ProductName) { return $false }
-        if ($InstallerType -eq "msi") {
-            return ([int]$_.WindowsInstaller -eq 1) -and (Test-MsiProductCode -ProductCode ([string]$_.PSChildName))
-        }
-        return [int]$_.WindowsInstaller -ne 1
+        if (-not (Test-TypedUninstallEntry -Entry $_ -ProductName $ProductName -InstallerType $InstallerType)) { return $false }
+        $identity = [string]$_.PSPath
+        return -not ($identity -and ($ExcludedIdentities -icontains $identity))
     })
     if ($matched.Count -eq 0) {
         throw "No typed $InstallerType uninstall entry with DisplayName '$ProductName' found across the scanned hives:`n  $($script:UninstallHives -join "`n  ")"
@@ -139,9 +292,14 @@ function Resolve-InstalledExecutable {
         [Parameter(Mandatory = $true)][string]$BinaryName
     )
 
-    $installLocation = $Entry.InstallLocation
-    if ($installLocation -and (Test-Path $installLocation)) {
-        $hits = @(Get-ChildItem -Path $installLocation -Recurse -Filter $BinaryName -File -ErrorAction SilentlyContinue)
+    $installLocation = [string]$Entry.InstallLocation
+    $resolvedInstallLocation = ""
+    if ($installLocation) {
+        if (-not (Test-Path $installLocation -PathType Container)) {
+            throw "Declared InstallLocation does not exist: '$installLocation'."
+        }
+        $resolvedInstallLocation = (Resolve-Path $installLocation).Path
+        $hits = @(Get-ChildItem -Path $resolvedInstallLocation -Recurse -Filter $BinaryName -File -ErrorAction Stop)
         if ($hits.Count -eq 1) {
             return $hits[0].FullName
         }
@@ -159,7 +317,14 @@ function Resolve-InstalledExecutable {
             (Test-Path $iconPath -PathType Leaf) -and
             ([System.IO.Path]::GetFileName($iconPath) -ieq $BinaryName)
         ) {
-            return (Resolve-Path $iconPath).Path
+            $resolvedIcon = (Resolve-Path $iconPath).Path
+            if ($resolvedInstallLocation) {
+                $relative = [System.IO.Path]::GetRelativePath($resolvedInstallLocation, $resolvedIcon)
+                if ([System.IO.Path]::IsPathRooted($relative) -or $relative -eq ".." -or $relative.StartsWith("..$([System.IO.Path]::DirectorySeparatorChar)")) {
+                    throw "DisplayIcon executable is outside InstallLocation: '$resolvedIcon'."
+                }
+            }
+            return $resolvedIcon
         }
     }
 
@@ -210,11 +375,27 @@ function Get-UninstallCommand {
         throw "NSIS uninstall entry has neither QuietUninstallString nor UninstallString."
     }
     $parsed = Split-CommandLine -CommandLine $command
+    $installLocation = [string]$Entry.InstallLocation
+    if ([string]::IsNullOrWhiteSpace($installLocation) -or -not (Test-Path $installLocation -PathType Container)) {
+        throw "NSIS uninstall metadata has no existing InstallLocation directory."
+    }
+    if (-not (Test-Path $parsed.File -PathType Leaf)) {
+        throw "NSIS uninstall executable does not exist: $($parsed.File)"
+    }
+    $installRoot = (Resolve-Path $installLocation).Path
+    $uninstaller = (Resolve-Path $parsed.File).Path
+    $relative = [System.IO.Path]::GetRelativePath($installRoot, $uninstaller)
+    if ([System.IO.Path]::IsPathRooted($relative) -or $relative -eq ".." -or $relative.StartsWith("..$([System.IO.Path]::DirectorySeparatorChar)")) {
+        throw "NSIS uninstall executable is outside InstallLocation: $uninstaller"
+    }
+    if ([System.IO.Path]::GetFileName($uninstaller) -ine "uninstall.exe") {
+        throw "NSIS uninstall executable must be the validated uninstall.exe under InstallLocation."
+    }
     $arguments = $parsed.Args
     if ($arguments -notmatch '(^|\s)/S(\s|$)') {
         $arguments = ($arguments + " /S").Trim()
     }
-    return @{ File = $parsed.File; Args = $arguments }
+    return @{ File = $uninstaller; Args = $arguments }
 }
 
 function Assert-UninstallResidue {
@@ -228,7 +409,7 @@ function Assert-UninstallResidue {
         return
     }
 
-    $residue = @(Get-ChildItem -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue)
+    $residue = @(Get-ChildItem -Path $InstallDir -Recurse -Force -ErrorAction Stop)
     if ($residue.Count -gt 0) {
         throw "Uninstall left residue under '$InstallDir': $(($residue | ForEach-Object { $_.FullName }) -join ', ')"
     }
@@ -249,22 +430,62 @@ function Install-Installer {
         $log = Join-Path $LogDir "msi-install.log"
         $arguments = "/i `"$Path`" /qn /norestart /l*v `"$log`""
         $process = Invoke-BoundedProcess -FilePath "msiexec.exe" -ArgumentList $arguments -TimeoutSeconds $TimeoutSeconds -Description "MSI install"
-        if ($process.ExitCode -ne 0) {
-            throw "MSI install failed with exit code $($process.ExitCode). See $log"
+        try {
+            if ($process.ExitCode -ne 0) {
+                throw "MSI install failed with exit code $($process.ExitCode). See $log"
+            }
+            return
+        } finally {
+            Stop-ProcessTree -Process $process
         }
-        return
     }
 
     $process = Invoke-BoundedProcess -FilePath $Path -ArgumentList "/S" -TimeoutSeconds $TimeoutSeconds -Description "NSIS install"
-    if ($process.ExitCode -ne 0) {
-        throw "NSIS install failed with exit code $($process.ExitCode)."
+    try {
+        if ($process.ExitCode -ne 0) {
+            throw "NSIS install failed with exit code $($process.ExitCode)."
+        }
+        $lastMetadataError = ""
+        while ((Get-Date) -lt $deadline) {
+            $found = @(Get-UninstallEntries | Where-Object {
+                Test-TypedUninstallEntry -Entry $_ -ProductName $ProductName -InstallerType nsis
+            })
+            if ($found.Count -eq 1) {
+                try {
+                    Get-UninstallCommand -Entry $found[0] -InstallerType nsis -LogDir $LogDir | Out-Null
+                    return
+                } catch {
+                    $lastMetadataError = $_.Exception.Message
+                }
+            } elseif ($found.Count -gt 1) {
+                $lastMetadataError = "Ambiguous NSIS uninstall metadata: $($found.Count) entries."
+            }
+            Start-Sleep -Seconds 1
+        }
+        throw "NSIS install completed but no trusted '$ProductName' uninstall entry became ready within $TimeoutSeconds seconds. Last metadata error: $lastMetadataError"
+    } finally {
+        Stop-ProcessTree -Process $process
     }
-    while ((Get-Date) -lt $deadline) {
-        $found = @(Get-UninstallEntries | Where-Object { $_.DisplayName -eq $ProductName })
-        if ($found.Count -ge 1) { return }
-        Start-Sleep -Seconds 1
+}
+
+function Get-BoundedLogContent {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][ValidateRange(1, [long]::MaxValue)][long]$MaxBytes
+    )
+
+    if (-not (Test-Path $Path -PathType Leaf)) { return "" }
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        if ($stream.Length -gt $MaxBytes) {
+            throw "Installed Parler launch log exceeded the $MaxBytes byte safety limit: $Path"
+        }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $read = $stream.Read($bytes, 0, $bytes.Length)
+        return [System.Text.Encoding]::UTF8.GetString($bytes, 0, $read)
+    } finally {
+        $stream.Dispose()
     }
-    throw "NSIS install completed but no '$ProductName' uninstall entry appeared within $TimeoutSeconds seconds."
 }
 
 function Invoke-LaunchGate {
@@ -289,6 +510,7 @@ function Invoke-LaunchGate {
             -RedirectStandardOutput $stdoutPath `
             -RedirectStandardError $stderrPath `
             -PassThru
+        $process = Register-ProcessJob -Process $process
 
         $deadline = (Get-Date).AddSeconds($LaunchSeconds)
         while ((Get-Date) -lt $deadline) {
@@ -302,15 +524,22 @@ function Invoke-LaunchGate {
             if ($process.HasExited) { break }
         }
 
-        $stdout = if (Test-Path $stdoutPath) { Get-Content $stdoutPath -Raw } else { "" }
-        $stderr = if (Test-Path $stderrPath) { Get-Content $stderrPath -Raw } else { "" }
+        $process.Refresh()
+        $exitedEarly = $process.HasExited
+        $exitCode = if ($exitedEarly) { $process.ExitCode } else { $null }
 
-        if ($process.HasExited) {
+        # Freeze all writers before the final size check and bounded read.
+        Stop-ProcessTree -Process $process
+        $process = $null
+        $stdout = Get-BoundedLogContent -Path $stdoutPath -MaxBytes $MaxLogBytes
+        $stderr = Get-BoundedLogContent -Path $stderrPath -MaxBytes $MaxLogBytes
+
+        if ($exitedEarly) {
             Write-Host "--- parler stdout ---"
             Write-Host $stdout
             Write-Host "--- parler stderr ---"
             Write-Host $stderr
-            throw "Installed Parler exited during launch gate with code $($process.ExitCode)"
+            throw "Installed Parler exited during launch gate with code $exitCode"
         }
 
         if ($stderr -match "panicked at|PluginInitialization|error while building tauri application") {
@@ -329,34 +558,38 @@ function Invoke-LaunchGate {
 function Invoke-Uninstall {
     param(
         [Parameter(Mandatory = $true)]$Command,
-        [Parameter(Mandatory = $true)][string]$ProductName,
+        [Parameter(Mandatory = $true)][string]$EntryIdentity,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ExePath,
         [Parameter(Mandatory = $true)][ValidateRange(1, 3600)][int]$TimeoutSeconds
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $process = Invoke-BoundedProcess -FilePath $Command.File -ArgumentList $Command.Args -TimeoutSeconds $TimeoutSeconds -Description "Uninstall command"
-    if ($process.ExitCode -ne 0) {
-        throw "Uninstall command '$($Command.File) $($Command.Args)' failed with exit code $($process.ExitCode)."
-    }
-
-    do {
-        $registryGone = @(Get-UninstallEntries | Where-Object { $_.DisplayName -eq $ProductName }).Count -eq 0
-        $exeGone = (-not $ExePath) -or (-not (Test-Path $ExePath -PathType Leaf))
-        if ($registryGone -and $exeGone) {
-            Write-Host "Uninstall complete: registry entry and executable removed."
-            return
-        }
-        Start-Sleep -Seconds 1
-    } while ((Get-Date) -lt $deadline)
-
-    $uninstallerName = [System.IO.Path]::GetFileName([string]$Command.File)
     try {
-        Stop-ProductProcesses -BinaryName $uninstallerName
-    } catch {
-        throw "Uninstall did not complete within $TimeoutSeconds seconds (registryGone=$registryGone, exeGone=$exeGone); detached uninstaller cleanup also failed: $($_.Exception.Message)"
+        if ($process.ExitCode -ne 0) {
+            throw "Uninstall command '$($Command.File) $($Command.Args)' failed with exit code $($process.ExitCode)."
+        }
+
+        do {
+            $registryGone = @(Get-UninstallEntries | Where-Object { [string]$_.PSPath -ieq $EntryIdentity }).Count -eq 0
+            $exeGone = (-not $ExePath) -or (-not (Test-Path $ExePath -PathType Leaf))
+            if ($registryGone -and $exeGone) {
+                Write-Host "Uninstall complete: registry entry and executable removed."
+                return
+            }
+            Start-Sleep -Seconds 1
+        } while ((Get-Date) -lt $deadline)
+
+        $uninstallerName = [System.IO.Path]::GetFileName([string]$Command.File)
+        try {
+            Stop-ProductProcesses -BinaryName $uninstallerName
+        } catch {
+            throw "Uninstall did not complete within $TimeoutSeconds seconds (registryGone=$registryGone, exeGone=$exeGone); detached uninstaller cleanup also failed: $($_.Exception.Message)"
+        }
+        throw "Uninstall did not complete within $TimeoutSeconds seconds (registryGone=$registryGone, exeGone=$exeGone)."
+    } finally {
+        Stop-ProcessTree -Process $process
     }
-    throw "Uninstall did not complete within $TimeoutSeconds seconds (registryGone=$registryGone, exeGone=$exeGone)."
 }
 
 function Invoke-InstallerLifecycle {
@@ -374,20 +607,36 @@ function Invoke-InstallerLifecycle {
     $logDir = Get-DiagnosticsDir -InstallerType $InstallerType
     $errors = [System.Collections.Generic.List[string]]::new()
     $entry = $null
+    $entryIdentity = ""
     $exePath = ""
     $installDir = ""
     $command = $null
+    $beforeIdentities = @()
+    $installationStarted = $false
 
     try {
         $installer = Get-InstallerFile -BundleDir $BundleDir -InstallerType $InstallerType
         Write-Host "Resolved $InstallerType installer: $installer"
+
+        $beforeEntries = @(Get-UninstallEntries)
+        $preExisting = @($beforeEntries | Where-Object {
+            Test-TypedUninstallEntry -Entry $_ -ProductName $ProductName -InstallerType $InstallerType
+        })
+        if ($preExisting.Count -gt 0) {
+            throw "Pre-existing $InstallerType uninstall metadata for '$ProductName' was found; refusing to overwrite or uninstall an untrusted instance."
+        }
+        $beforeIdentities = @($beforeEntries | ForEach-Object { [string]$_.PSPath } | Where-Object { $_ })
+
+        $installationStarted = $true
         Install-Installer -Path $installer -InstallerType $InstallerType -LogDir $logDir -ProductName $ProductName -TimeoutSeconds $InstallTimeoutSeconds
 
-        $entry = Select-UninstallEntry -Entries (Get-UninstallEntries) -ProductName $ProductName -InstallerType $InstallerType
-        $exePath = Resolve-InstalledExecutable -Entry $entry -BinaryName $BinaryName
-        $installDir = Split-Path -Parent $exePath
-        Write-Host "Installed executable: $exePath"
+        $entry = Select-UninstallEntry -Entries @(Get-UninstallEntries) -ProductName $ProductName -InstallerType $InstallerType -ExcludedIdentities $beforeIdentities
+        $entryIdentity = Get-UninstallEntryIdentity -Entry $entry
+        $installDir = [string]$entry.InstallLocation
         $command = Get-UninstallCommand -Entry $entry -InstallerType $InstallerType -LogDir $logDir
+        $exePath = Resolve-InstalledExecutable -Entry $entry -BinaryName $BinaryName
+        if (-not $installDir) { $installDir = Split-Path -Parent $exePath }
+        Write-Host "Installed executable: $exePath"
 
         Invoke-LaunchGate -ExePath $exePath -LaunchSeconds $LaunchSeconds -LogDir $logDir -BinaryName $BinaryName -MaxLogBytes $MaxLaunchLogBytes
     }
@@ -401,10 +650,13 @@ function Invoke-InstallerLifecycle {
             $errors.Add("Process cleanup failed: $($_.Exception.Message)")
         }
 
-        if (-not $entry) {
+        if ($installationStarted -and -not $entry) {
             try {
-                $entry = Select-UninstallEntry -Entries (Get-UninstallEntries) -ProductName $ProductName -InstallerType $InstallerType
-            } catch { }
+                $entry = Select-UninstallEntry -Entries @(Get-UninstallEntries) -ProductName $ProductName -InstallerType $InstallerType -ExcludedIdentities $beforeIdentities
+                $entryIdentity = Get-UninstallEntryIdentity -Entry $entry
+            } catch {
+                $errors.Add("Unable to identify installed entry for cleanup: $($_.Exception.Message)")
+            }
         }
 
         if ($entry) {
@@ -412,10 +664,13 @@ function Invoke-InstallerLifecycle {
                 $installDir = [string]$entry.InstallLocation
             }
             try {
+                if (-not $entryIdentity) {
+                    $entryIdentity = Get-UninstallEntryIdentity -Entry $entry
+                }
                 if (-not $command) {
                     $command = Get-UninstallCommand -Entry $entry -InstallerType $InstallerType -LogDir $logDir
                 }
-                Invoke-Uninstall -Command $command -ProductName $ProductName -ExePath $exePath -TimeoutSeconds $UninstallTimeoutSeconds
+                Invoke-Uninstall -Command $command -EntryIdentity $entryIdentity -ExePath $exePath -TimeoutSeconds $UninstallTimeoutSeconds
             } catch {
                 $errors.Add("Uninstall cleanup failed: $($_.Exception.Message)")
             }

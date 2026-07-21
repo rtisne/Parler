@@ -224,7 +224,16 @@ export function collectReusableCallInputs(
   const violations: WorkflowViolation[] = [];
   for (const [jobName, job] of jobEntries(doc)) {
     const uses = job.uses;
-    if (typeof uses !== "string" || !uses.endsWith("build.yml")) continue;
+    if (typeof uses !== "string") continue;
+    if (uses !== "./.github/workflows/build.yml") {
+      violations.push({
+        workflow,
+        location: `jobs.${jobName}.uses`,
+        value: uses,
+        reason: "job-level reusable workflow is not allowlisted",
+      });
+      continue;
+    }
     const withInputs = job.with;
     if (!isRecord(withInputs)) continue;
 

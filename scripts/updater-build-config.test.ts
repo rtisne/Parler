@@ -214,5 +214,9 @@ describe("Installer lifecycle gates", () => {
     expect(legacy).toContain('target: "aarch64-pc-windows-msvc"');
     expect(legacy).not.toContain("softprops/action-gh-release");
     expect(legacy).not.toContain("create-release:");
+    expect(legacy).toContain("contents: read");
+    expect(legacy).not.toContain("contents: write");
+    expect(legacy).not.toContain("id-token: write");
+    expect(legacy).not.toContain("secrets: inherit");
   });
 });

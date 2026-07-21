@@ -131,19 +131,65 @@ describe("windows-only CI collectors (self-test)", () => {
     expect(collectRunsOn("other.yml", fixture).length).toBeGreaterThan(0);
     expect(collectRunsOn("build.yml", fixture)).toEqual([]);
   });
+
+  test("rejects unaudited job-level reusable workflow calls", () => {
+    const fixture = {
+      jobs: {
+        remote: {
+          uses: "acme/project/.github/workflows/linux.yml@v1",
+        },
+      },
+    };
+
+    expect(collectAllViolations("fixture", fixture).length).toBeGreaterThan(0);
+  });
 });
 
 describe("required Windows CI topology", () => {
-  test("release keeps exactly the native x64 and ARM64 matrix", () => {
-    const release = parseWorkflow("release.yml") as any;
-    const include = release.jobs["publish-tauri"].strategy.matrix.include;
-    expect(include.map((entry: any) => [entry.platform, entry.target])).toEqual(
+  const expectedMatrices: Record<string, Array<[string, string, string]>> = {
+    "build-test.yml": [
+      ["windows-latest", "x86_64-pc-windows-msvc", ""],
       [
-        ["windows-latest", "x86_64-pc-windows-msvc"],
-        ["windows-11-arm", "aarch64-pc-windows-msvc"],
+        "windows-11-arm",
+        "aarch64-pc-windows-msvc",
+        "--target aarch64-pc-windows-msvc",
       ],
-    );
-  });
+    ],
+    "pr-test-build.yml": [
+      ["windows-latest", "x86_64-pc-windows-msvc", ""],
+      [
+        "windows-11-arm",
+        "aarch64-pc-windows-msvc",
+        "--target aarch64-pc-windows-msvc",
+      ],
+    ],
+    "build-windows.yml": [
+      ["windows-latest", "x86_64-pc-windows-msvc", "--bundles nsis,msi"],
+      [
+        "windows-11-arm",
+        "aarch64-pc-windows-msvc",
+        "--target aarch64-pc-windows-msvc --bundles nsis,msi",
+      ],
+    ],
+    "release.yml": [
+      ["windows-latest", "x86_64-pc-windows-msvc", "--bundles nsis,msi"],
+      ["windows-11-arm", "aarch64-pc-windows-msvc", "--bundles nsis,msi"],
+    ],
+  };
+
+  for (const [name, expected] of Object.entries(expectedMatrices)) {
+    test(`${name} keeps exactly the native x64 and ARM64 matrix`, () => {
+      const workflow = parseWorkflow(name) as any;
+      const reusableJobs = Object.values(workflow.jobs).filter(
+        (job: any) => job.uses === "./.github/workflows/build.yml",
+      ) as any[];
+      expect(reusableJobs).toHaveLength(1);
+      const include = reusableJobs[0].strategy.matrix.include;
+      expect(
+        include.map((entry: any) => [entry.platform, entry.target, entry.args]),
+      ).toEqual(expected);
+    });
+  }
 
   test("lint enforces the structural CI test", () => {
     const lint = parseWorkflow("lint.yml") as any;
