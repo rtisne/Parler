@@ -25,12 +25,13 @@ planned | adapted | cherry-picked | already-present | deferred | rejected
 
 ## Ledger
 
-| Upstream SHA | Capability                | Local PR | Local commit | Status   | Notes                                                                                                    |
-| ------------ | ------------------------- | -------- | ------------ | -------- | -------------------------------------------------------------------------------------------------------- |
-| `5b651cc`    | Windows Thin LTO          | #22      | `964b79f`    | adapted  | One-line manual port; keeps `panic = "abort"`; PR merge build validated on Windows x64                   |
-| `4239cd3`    | Secret log redaction      | #21      | `433c556`    | adapted  | Also covers the Gemini key; no serialized settings change                                                |
-| (fork)       | Updater fork isolation    | #21      | `70e62e0`    | adapted  | Melvynx feed removed; checks disabled until a signed rtisne feed is available                            |
-| `f4fca4b`    | Selective hotkey blocking | #22      | `c3ac2b1`    | deferred | Port removed after review: `handy-keys 0.2.4` lacks safe Linux listener and transactional hook semantics |
+| Upstream SHA | Capability                | Local PR | Local commit | Status   | Notes                                                                                                        |
+| ------------ | ------------------------- | -------- | ------------ | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `5b651cc`    | Windows Thin LTO          | #22      | `964b79f`    | adapted  | One-line manual port; keeps `panic = "abort"`; PR merge build validated on Windows x64                       |
+| `(local)`    | Windows OpenBLAS runtime  | pending  | pending      | adapted  | No Melvynx commit; uses pinned OpenBLAS 0.3.31 x64/WOA64 archives and Windows-only Cargo feature unification |
+| `4239cd3`    | Secret log redaction      | #21      | `433c556`    | adapted  | Also covers the Gemini key; no serialized settings change                                                    |
+| (fork)       | Updater fork isolation    | #21      | `70e62e0`    | adapted  | Melvynx feed removed; checks disabled until a signed rtisne feed is available                                |
+| `f4fca4b`    | Selective hotkey blocking | #22      | `c3ac2b1`    | deferred | Port removed after review: `handy-keys 0.2.4` lacks safe Linux listener and transactional hook semantics     |
 
 ## Provenance trailer
 

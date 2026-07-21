@@ -39,6 +39,10 @@ jobs:
           workspaces: "./src-tauri -> target"
           key: windows-latest-x86_64-pc-windows-msvc
 
+      - name: Setup OpenBLAS
+        shell: pwsh
+        run: ./.github/scripts/setup-openblas.ps1 -Target "x86_64-pc-windows-msvc"
+
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
@@ -54,6 +58,17 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: "--bundles nsis,msi"
+
+      - name: Verify staged OpenBLAS runtime
+        shell: pwsh
+        run: |
+          $file = "src-tauri/openblas-libs/libopenblas.dll"
+          if (-not (Test-Path $file -PathType Leaf)) {
+            throw "Required staged OpenBLAS runtime is missing: $file"
+          }
+          if ((Get-Item $file).Length -eq 0) {
+            throw "Staged OpenBLAS runtime is empty: $file"
+          }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

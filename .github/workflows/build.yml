@@ -105,6 +105,11 @@ jobs:
           workspaces: "./src-tauri -> target"
           key: ${{ inputs.platform }}-${{ inputs.target }}
 
+      - name: Setup OpenBLAS (Windows)
+        if: contains(inputs.platform, 'windows')
+        shell: pwsh
+        run: ./.github/scripts/setup-openblas.ps1 -Target "${{ inputs.target }}"
+
       - name: install dependencies (ubuntu 24.04 x64)
         if: contains(inputs.platform, 'ubuntu-24.04') && !contains(inputs.platform, 'arm')
         run: |
@@ -383,6 +388,25 @@ jobs:
           releaseId: ${{ inputs.release-id }}
           assetNamePattern: ${{ steps.patch-release-name.outputs.platform }}
           args: ${{ inputs.build-args }}
+
+      - name: Verify staged OpenBLAS runtime (Windows)
+        if: contains(inputs.platform, 'windows')
+        shell: pwsh
+        run: |
+          $required = @("src-tauri/openblas-libs/libopenblas.dll")
+          if ("${{ inputs.target }}" -eq "aarch64-pc-windows-msvc") {
+            $required += "src-tauri/openblas-libs/openblas.dll"
+          }
+          foreach ($file in $required) {
+            if (-not (Test-Path $file -PathType Leaf)) {
+              throw "Required staged OpenBLAS runtime is missing: $file"
+            }
+            $size = (Get-Item $file).Length
+            if ($size -eq 0) {
+              throw "Staged OpenBLAS runtime is empty: $file"
+            }
+            Write-Host "$file $size bytes"
+          }
 
       - name: Upload artifacts (macOS)
         if: inputs.upload-artifacts && contains(inputs.platform, 'macos')
