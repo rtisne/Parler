@@ -17,6 +17,9 @@ jobs:
       - name: Test translation baseline validator
         run: bun run test:translations
 
+      - name: Test packaged build configuration
+        run: bun run test:build-config
+
       - name: Check translation consistency
         run: bun run check:translations
 
