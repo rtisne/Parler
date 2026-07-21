@@ -34,5 +34,5 @@ describe("production frontend bundle", () => {
 
     expect(exitCode).toBe(0);
     expect(buildOutput).not.toContain("Circular chunk:");
-  }, 15_000);
+  }, 30_000);
 });

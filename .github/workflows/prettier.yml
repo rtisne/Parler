@@ -5,6 +5,9 @@ jobs:
   prettier:
     runs-on: windows-latest
     steps:
+      - name: Preserve repository LF line endings
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@v4
 
       - uses: oven-sh/setup-bun@v2

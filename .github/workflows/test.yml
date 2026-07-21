@@ -15,6 +15,10 @@ jobs:
           workspaces: "./src-tauri -> target"
           key: windows-latest-tests
 
+      - name: Setup OpenBLAS (Windows x64)
+        shell: pwsh
+        run: ./.github/scripts/setup-openblas.ps1 -Target "x86_64-pc-windows-msvc"
+
       - name: Use mock TranscriptionManager (CI only)
         shell: bash
         working-directory: src-tauri

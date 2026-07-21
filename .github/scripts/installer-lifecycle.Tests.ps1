@@ -1,11 +1,11 @@
 BeforeAll {
     $env:PARLER_LIFECYCLE_NO_RUN = "1"
     . (Join-Path $PSScriptRoot "installer-lifecycle.ps1")
-}
 
-function New-TempDir {
-    New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid())) |
-        Select-Object -ExpandProperty FullName
+    function New-TempDir {
+        New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid())) |
+            Select-Object -ExpandProperty FullName
+    }
 }
 
 Describe "Get-InstallerFile" {
