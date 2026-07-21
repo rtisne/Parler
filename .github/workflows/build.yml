@@ -289,14 +289,14 @@ jobs:
         run: |
           ./.github/scripts/installer-lifecycle.ps1 `
             -InstallerType msi `
-            -BundleDir "${{ inputs.target != '' && inputs.target != 'x86_64-pc-windows-msvc' && format('src-tauri/target/{0}/{1}/bundle', inputs.target, steps.build-profile.outputs.profile) || format('src-tauri/target/{0}/bundle', steps.build-profile.outputs.profile) }}"
+            -BundleDir "${{ contains(inputs.build-args, '--target') && format('src-tauri/target/{0}/{1}/bundle', inputs.target, steps.build-profile.outputs.profile) || format('src-tauri/target/{0}/bundle', steps.build-profile.outputs.profile) }}"
 
       - name: Installer lifecycle test (NSIS)
         shell: pwsh
         run: |
           ./.github/scripts/installer-lifecycle.ps1 `
             -InstallerType nsis `
-            -BundleDir "${{ inputs.target != '' && inputs.target != 'x86_64-pc-windows-msvc' && format('src-tauri/target/{0}/{1}/bundle', inputs.target, steps.build-profile.outputs.profile) || format('src-tauri/target/{0}/bundle', steps.build-profile.outputs.profile) }}"
+            -BundleDir "${{ contains(inputs.build-args, '--target') && format('src-tauri/target/{0}/{1}/bundle', inputs.target, steps.build-profile.outputs.profile) || format('src-tauri/target/{0}/bundle', steps.build-profile.outputs.profile) }}"
 
       - name: Upload installer lifecycle diagnostics
         if: failure()
@@ -314,6 +314,6 @@ jobs:
           name: ${{ inputs.asset-prefix }}-${{ inputs.target }}
           # Default Windows builds place bundles under release/, but cross-compiles (ARM64) nest under target/<triple>/release.
           path: |
-            src-tauri/target/${{ inputs.target != '' && inputs.target != 'x86_64-pc-windows-msvc' && format('{0}/{1}', inputs.target, steps.build-profile.outputs.profile) || steps.build-profile.outputs.profile }}/bundle/msi/*.msi
-            src-tauri/target/${{ inputs.target != '' && inputs.target != 'x86_64-pc-windows-msvc' && format('{0}/{1}', inputs.target, steps.build-profile.outputs.profile) || steps.build-profile.outputs.profile }}/bundle/nsis/*.exe
+            src-tauri/target/${{ contains(inputs.build-args, '--target') && format('{0}/{1}', inputs.target, steps.build-profile.outputs.profile) || steps.build-profile.outputs.profile }}/bundle/msi/*.msi
+            src-tauri/target/${{ contains(inputs.build-args, '--target') && format('{0}/{1}', inputs.target, steps.build-profile.outputs.profile) || steps.build-profile.outputs.profile }}/bundle/nsis/*.exe
           retention-days: 30

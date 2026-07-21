@@ -24,6 +24,13 @@ function buildWorkflow(): string {
   );
 }
 
+function workflow(name: string): string {
+  return readFileSync(
+    resolve(import.meta.dir, `../.github/workflows/${name}`),
+    "utf8",
+  );
+}
+
 function updaterDisableCommand(): string {
   const command = buildWorkflow().match(
     /- name: Disable updater artifacts signing[\s\S]*?node -e '([^'\n]*)'/,
@@ -177,5 +184,35 @@ describe("Installer lifecycle gates", () => {
     );
     expect(diagnosticsSection).toContain("if: failure()");
     expect(diagnosticsSection).toContain("installer-lifecycle");
+  });
+
+  test("derives bundle paths from whether Tauri was given an explicit target", () => {
+    const workflowText = buildWorkflow();
+    const lifecycleStart = workflowText.indexOf(
+      "- name: Installer lifecycle test (MSI)",
+    );
+    const lifecycleEnd = workflowText.indexOf(
+      "- name: Upload artifacts (Windows)",
+    );
+    const lifecycleSection = workflowText.slice(lifecycleStart, lifecycleEnd);
+    const uploadSection = workflowText.slice(lifecycleEnd);
+
+    expect(
+      lifecycleSection.match(/contains\(inputs\.build-args, '--target'\)/g)
+        ?.length,
+    ).toBe(2);
+    expect(uploadSection).toContain("contains(inputs.build-args, '--target')");
+  });
+
+  test("legacy manual Windows build delegates both architectures and cannot publish directly", () => {
+    const legacy = workflow("build-windows.yml");
+
+    expect(legacy).toContain("uses: ./.github/workflows/build.yml");
+    expect(legacy).toContain('platform: "windows-latest"');
+    expect(legacy).toContain('platform: "windows-11-arm"');
+    expect(legacy).toContain('target: "x86_64-pc-windows-msvc"');
+    expect(legacy).toContain('target: "aarch64-pc-windows-msvc"');
+    expect(legacy).not.toContain("softprops/action-gh-release");
+    expect(legacy).not.toContain("create-release:");
   });
 });

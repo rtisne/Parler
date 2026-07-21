@@ -33,7 +33,17 @@ const FORBIDDEN_STEP_TOKENS = [
   ".rpm",
   ".dmg",
   "fuse",
+  "setup-ubuntu",
+  "setup-macos",
+  "docker://",
+  "dnf install",
+  "apk add",
+  "brew install",
 ];
+
+function workflowBasename(workflow: string): string {
+  return workflow.replaceAll("\\", "/").split("/").at(-1) ?? workflow;
+}
 
 function isRecord(value: Json): value is Record<string, Json> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -86,7 +96,11 @@ export function collectRunsOn(
         });
         continue;
       }
-      if (value === PLATFORM_EXPRESSION || WINDOWS_RUNNER.test(value)) {
+      if (
+        WINDOWS_RUNNER.test(value) ||
+        (value === PLATFORM_EXPRESSION &&
+          workflowBasename(workflow) === "build.yml")
+      ) {
         continue;
       }
       violations.push({
@@ -115,6 +129,47 @@ export function collectMatrixEntries(
     if (!isRecord(strategy)) continue;
     const matrix = strategy.matrix;
     if (!isRecord(matrix)) continue;
+    for (const [axis, validator, reason] of [
+      ["platform", WINDOWS_RUNNER, "matrix platform is not a Windows runner"],
+      ["target", WINDOWS_TARGET, "matrix target is not a Windows MSVC triple"],
+    ] as const) {
+      const values = matrix[axis];
+      if (values === undefined) continue;
+      if (!Array.isArray(values) || values.length === 0) {
+        violations.push({
+          workflow,
+          location: `jobs.${jobName}.strategy.matrix.${axis}`,
+          value: JSON.stringify(values),
+          reason: `matrix ${axis} axis must be a non-empty array`,
+        });
+        continue;
+      }
+      values.forEach((value, index) => {
+        if (typeof value !== "string" || !validator.test(value)) {
+          violations.push({
+            workflow,
+            location: `jobs.${jobName}.strategy.matrix.${axis}[${index}]`,
+            value: String(value),
+            reason,
+          });
+        }
+      });
+    }
+
+    const argsAxis = matrix.args;
+    if (Array.isArray(argsAxis)) {
+      argsAxis.forEach((value, index) => {
+        if (typeof value !== "string" || FORBIDDEN_ARGS.test(value)) {
+          violations.push({
+            workflow,
+            location: `jobs.${jobName}.strategy.matrix.args[${index}]`,
+            value: String(value),
+            reason: "matrix args reference a non-Windows bundle/target",
+          });
+        }
+      });
+    }
+
     const include = matrix.include;
     if (!Array.isArray(include)) continue;
 
@@ -173,11 +228,27 @@ export function collectReusableCallInputs(
     const withInputs = job.with;
     if (!isRecord(withInputs)) continue;
 
+    const strategy = isRecord(job.strategy) ? job.strategy : {};
+    const matrix = isRecord(strategy.matrix) ? strategy.matrix : {};
+    const include = Array.isArray(matrix.include) ? matrix.include : [];
+    const matrixProvides = (key: string): boolean => {
+      const axis = matrix[key];
+      if (Array.isArray(axis) && axis.length > 0) return true;
+      return (
+        include.length > 0 &&
+        include.every(
+          (entry) => isRecord(entry) && typeof entry[key] === "string",
+        )
+      );
+    };
+
     const platform = withInputs.platform;
     if (
       typeof platform === "string" &&
-      !isExpression(platform) &&
-      !WINDOWS_RUNNER.test(platform)
+      ((!isExpression(platform) && !WINDOWS_RUNNER.test(platform)) ||
+        (isExpression(platform) &&
+          (platform !== "${{ matrix.platform }}" ||
+            !matrixProvides("platform"))))
     ) {
       violations.push({
         workflow,
@@ -190,8 +261,9 @@ export function collectReusableCallInputs(
     const target = withInputs.target;
     if (
       typeof target === "string" &&
-      !isExpression(target) &&
-      !WINDOWS_TARGET.test(target)
+      ((!isExpression(target) && !WINDOWS_TARGET.test(target)) ||
+        (isExpression(target) &&
+          (target !== "${{ matrix.target }}" || !matrixProvides("target"))))
     ) {
       violations.push({
         workflow,
@@ -231,6 +303,7 @@ export function collectStepViolations(
       if (!isRecord(step)) return;
       const base = `jobs.${jobName}.steps[${index}]`;
       const scanned: Array<[string, Json]> = [
+        ["uses", step.uses],
         ["run", step.run],
         ["if", step.if],
         ["env", step.env],
@@ -241,7 +314,14 @@ export function collectStepViolations(
         const leaves: string[] = [];
         collectStringLeaves(fieldValue, leaves);
         for (const leaf of leaves) {
-          const lower = leaf.toLowerCase();
+          const scannedLeaf =
+            field === "run"
+              ? leaf
+                  .split(/\r?\n/)
+                  .filter((line) => !line.trimStart().startsWith("#"))
+                  .join("\n")
+              : leaf;
+          const lower = scannedLeaf.toLowerCase();
           for (const token of FORBIDDEN_STEP_TOKENS) {
             if (lower.includes(token.toLowerCase())) {
               violations.push({

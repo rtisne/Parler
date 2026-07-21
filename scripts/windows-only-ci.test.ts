@@ -75,6 +75,9 @@ describe("windows-only CI collectors (self-test)", () => {
       jobs: {
         good: {
           "runs-on": "windows-latest",
+          steps: [{ name: "build", run: "bun install --frozen-lockfile" }],
+        },
+        reusable: {
           strategy: {
             matrix: {
               include: [
@@ -86,9 +89,6 @@ describe("windows-only CI collectors (self-test)", () => {
               ],
             },
           },
-          steps: [{ name: "build", run: "bun install --frozen-lockfile" }],
-        },
-        reusable: {
           uses: "./.github/workflows/build.yml",
           with: {
             platform: "${{ matrix.platform }}",
@@ -99,5 +99,59 @@ describe("windows-only CI collectors (self-test)", () => {
     };
 
     expect(collectAllViolations("fixture", fixture)).toEqual([]);
+  });
+
+  test("collectors reject non-Windows matrix axes feeding reusable inputs", () => {
+    const fixture = {
+      jobs: {
+        reusable: {
+          strategy: {
+            matrix: {
+              platform: ["ubuntu-latest"],
+              target: ["x86_64-unknown-linux-gnu"],
+            },
+          },
+          uses: "./.github/workflows/build.yml",
+          with: {
+            platform: "${{ matrix.platform }}",
+            target: "${{ matrix.target }}",
+          },
+        },
+      },
+    };
+
+    expect(collectAllViolations("fixture", fixture).length).toBeGreaterThan(0);
+  });
+
+  test("only build.yml may resolve runs-on from inputs.platform", () => {
+    const fixture = {
+      jobs: { build: { "runs-on": "${{ inputs.platform }}" } },
+    };
+
+    expect(collectRunsOn("other.yml", fixture).length).toBeGreaterThan(0);
+    expect(collectRunsOn("build.yml", fixture)).toEqual([]);
+  });
+});
+
+describe("required Windows CI topology", () => {
+  test("release keeps exactly the native x64 and ARM64 matrix", () => {
+    const release = parseWorkflow("release.yml") as any;
+    const include = release.jobs["publish-tauri"].strategy.matrix.include;
+    expect(include.map((entry: any) => [entry.platform, entry.target])).toEqual(
+      [
+        ["windows-latest", "x86_64-pc-windows-msvc"],
+        ["windows-11-arm", "aarch64-pc-windows-msvc"],
+      ],
+    );
+  });
+
+  test("lint enforces the structural CI test", () => {
+    const lint = parseWorkflow("lint.yml") as any;
+    const commands = lint.jobs.lint.steps.map((step: any) => step.run ?? "");
+    expect(
+      commands.some((command: string) =>
+        command.includes("bun run test:ci-structure"),
+      ),
+    ).toBe(true);
   });
 });

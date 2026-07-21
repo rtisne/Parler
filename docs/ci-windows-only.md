@@ -21,7 +21,7 @@ actually installed, launched, and uninstalled before they can reach anyone.
 | Build Test (dispatch) | 7 build matrix (2 macOS + 3 Linux + 2 Windows)         | 2 build matrix (Windows x64 + ARM64)            |
 | PR Test Build         | 8 (7 builds + ubuntu comment)                          | 3 (2 Windows builds + Windows comment)          |
 | Release               | 4 (2 ubuntu + 2 Windows)                               | 4 (all Windows)                                 |
-| Build Windows         | 2 (1 Windows build + ubuntu release)                   | 2 (all Windows)                                 |
+| Build Windows         | 2 (1 Windows build + ubuntu release)                   | 2 reusable builds (Windows x64 + ARM64)         |
 | **Total**             | **25 jobs — 18 non-Windows (72%)**                     | **16 jobs — 0 non-Windows**                     |
 
 The heavyweight build matrix drops from **7 → 2** entries per dispatch of Build
@@ -32,15 +32,16 @@ Test / PR Test Build (−71%).
 ### 1. Structural regression test — `bun run test:ci-structure`
 
 `scripts/windows-only-ci.test.ts` parses every `.github/workflows/*.yml` with
-`Bun.YAML.parse` (structural, comment-insensitive) and fails if any workflow
+`Bun.YAML.parse` (structural, YAML-comment-insensitive) and fails if any workflow
 reintroduces:
 
 - a `runs-on` that is not a `windows-*` runner (or the single sanctioned
   `${{ inputs.platform }}` expression used by the reusable `build.yml`);
-- a `strategy.matrix.include[]` whose `platform`/`target`/`args` reference
-  macOS or Linux;
-- a literal reusable-call `with.platform`/`with.target` that is not Windows;
-- a step whose `run`/`if`/`env`/`with` **value** contains a macOS/Linux token
+- a matrix axis or `strategy.matrix.include[]` whose `platform`/`target`/`args`
+  reference macOS or Linux;
+- a reusable-call `with.platform`/`with.target` that is not Windows, or an
+  expression that cannot be traced to a validated matrix value;
+- a step whose `uses`/`run`/`if`/`env`/`with` **value** contains a macOS/Linux token
   (`apt-get`, `ubuntu`, `macos`, `APPLE_CERTIFICATE`, `apple-darwin`,
   `unknown-linux-gnu`, `appimage`, `.deb`, `.rpm`, `.dmg`, `fuse`).
 
@@ -55,22 +56,28 @@ NSIS it performs:
 
 1. **Resolve** the single installer under `bundle/msi/*.msi` or
    `bundle/nsis/*-setup.exe` (ambiguity → fail).
-2. **Silent install** — `msiexec /i … /qn` (MSI, per-machine → HKLM) or the
-   uppercase `/S` NSIS switch (per-user → `%LOCALAPPDATA%\Parler`, HKCU).
+2. **Bounded silent install** — `msiexec /i … /qn` (MSI, per-machine → HKLM)
+   or the uppercase `/S` NSIS switch (per-user → `%LOCALAPPDATA%\Parler`, HKCU).
+   A hung installer is terminated with its process tree.
 3. **Resolve the installed exe** from the uninstall-registry metadata
    (`DisplayName -eq 'Parler'` across all four HKLM/HKCU + WOW6432Node hives),
-   via `InstallLocation` with a `DisplayIcon` fallback.
+   via `InstallLocation` with an exact-filename `DisplayIcon` fallback. MSI
+   entries must be Windows Installer entries with a valid ProductCode GUID.
 4. **Bounded launch survival** — launch `parler.exe --no-tray`, keep it alive
-   for a fixed window, scan stderr for startup panics, then force-kill and
-   confirm the process is gone.
+   for a fixed window, scan stderr for startup panics, enforce a 10 MiB log
+   safety limit, then force-kill the process tree and confirm the product
+   process is gone.
 5. **Real silent uninstall** — `msiexec /x {ProductCode}` or the NSIS
    `QuietUninstallString`/`UninstallString` (with `/S`). Because an NSIS
    uninstaller detaches a `%TEMP%` copy and returns early, completion is
-   confirmed with a bounded poll (up to 120 s) until both the registry entry and
-   the executable are gone.
-6. **Residue verification** — fail if any `parler.exe` or `*.dll` remains.
+   confirmed with a bounded process wait and poll (up to 120 s) until both the
+   registry entry and the executable are gone. Failure paths run the same
+   uninstall cleanup in `finally`.
+6. **Residue verification** — the install directory must be removed or empty;
+   any remaining file or directory fails the gate.
 
-On failure, MSI logs and the app's stdout/stderr are uploaded as the
+On failure, MSI logs and the app's stdout/stderr (isolated per installer type)
+are uploaded as the
 `installer-lifecycle-logs-<target>` artifact.
 
 The helper's pure logic (file resolution, entry selection, command
@@ -81,7 +88,9 @@ construction, exe resolution, residue assertion) is covered by
 ## Why publication is gated
 
 The lifecycle steps live **inside the `build` job** of the reusable
-`build.yml`, so a failure fails that job. In `release.yml`, `publish-release`
+`build.yml`, so a failure fails that job. The manual `build-windows.yml` also
+delegates both architectures to `build.yml` and has no publication job. In
+`release.yml`, `publish-release`
 requires `needs.publish-tauri.result == 'success'`, and `publish-tauri` is the
 matrix that calls `build.yml`. A lifecycle failure on either architecture
 therefore leaves the release a **draft** — a broken installer can never be
