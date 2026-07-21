@@ -1066,20 +1066,26 @@ mod tests {
     }
 
     #[test]
+    fn default_settings_disable_update_checks() {
+        assert!(!get_default_settings().update_checks_enabled);
+    }
+
+    #[test]
     fn debug_output_never_contains_credentials() {
         let mut settings = get_default_settings();
         settings.gemini_api_key = Some("gemini-secret-sentinel".into());
-        settings
-            .post_process_api_keys
-            .insert("openai".into(), "openai-secret-sentinel".into());
+        settings.post_process_api_keys.clear();
+        settings.post_process_api_keys.insert(
+            "provider-id-sentinel".into(),
+            "provider-secret-sentinel".into(),
+        );
 
         let output = format!("{settings:?}");
         assert!(!output.contains("gemini-secret-sentinel"));
-        assert!(!output.contains("openai-secret-sentinel"));
-        // The redaction marker should be present so we know the fields are
-        // still rendered (just sanitized), not silently dropped.
-        assert!(output.contains("[REDACTED]"));
-        // Provider ids are not secret and remain visible for debugging.
-        assert!(output.contains("openai"));
+        assert!(!output.contains("provider-secret-sentinel"));
+        assert!(output.contains("gemini_api_key: Some(\"[REDACTED]\")"));
+        assert!(
+            output.contains("post_process_api_keys: {\"provider-id-sentinel\": \"[REDACTED]\"}")
+        );
     }
 }
