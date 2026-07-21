@@ -9,31 +9,31 @@ BeforeAll {
 }
 
 Describe "Get-InstallerFile" {
-    BeforeEach { $script:bundleDir = New-TempDir }
-    AfterEach { Remove-Item -Recurse -Force $script:bundleDir -ErrorAction SilentlyContinue }
+    BeforeEach { $script:testBundleDir = New-TempDir }
+    AfterEach { Remove-Item -Recurse -Force $script:testBundleDir -ErrorAction SilentlyContinue }
 
     It "returns the single msi in the bundle" {
-        $msiDir = New-Item -ItemType Directory -Path (Join-Path $bundleDir "msi")
+        $msiDir = New-Item -ItemType Directory -Path (Join-Path $testBundleDir "msi")
         New-Item -ItemType File -Path (Join-Path $msiDir "Parler_0.1.0_x64_en-US.msi") | Out-Null
-        Get-InstallerFile -BundleDir $bundleDir -InstallerType msi | Should -Match "Parler_0.1.0_x64_en-US.msi"
+        Get-InstallerFile -BundleDir $testBundleDir -InstallerType msi | Should -Match "Parler_0.1.0_x64_en-US.msi"
     }
 
     It "throws when there is no msi" {
-        New-Item -ItemType Directory -Path (Join-Path $bundleDir "msi") | Out-Null
-        { Get-InstallerFile -BundleDir $bundleDir -InstallerType msi } | Should -Throw
+        New-Item -ItemType Directory -Path (Join-Path $testBundleDir "msi") | Out-Null
+        { Get-InstallerFile -BundleDir $testBundleDir -InstallerType msi } | Should -Throw
     }
 
     It "throws when there are two msi files (ambiguous)" {
-        $msiDir = New-Item -ItemType Directory -Path (Join-Path $bundleDir "msi")
+        $msiDir = New-Item -ItemType Directory -Path (Join-Path $testBundleDir "msi")
         New-Item -ItemType File -Path (Join-Path $msiDir "a.msi") | Out-Null
         New-Item -ItemType File -Path (Join-Path $msiDir "b.msi") | Out-Null
-        { Get-InstallerFile -BundleDir $bundleDir -InstallerType msi } | Should -Throw
+        { Get-InstallerFile -BundleDir $testBundleDir -InstallerType msi } | Should -Throw
     }
 
     It "resolves the nsis setup exe" {
-        $nsisDir = New-Item -ItemType Directory -Path (Join-Path $bundleDir "nsis")
+        $nsisDir = New-Item -ItemType Directory -Path (Join-Path $testBundleDir "nsis")
         New-Item -ItemType File -Path (Join-Path $nsisDir "Parler_0.1.0_x64-setup.exe") | Out-Null
-        Get-InstallerFile -BundleDir $bundleDir -InstallerType nsis | Should -Match "setup.exe"
+        Get-InstallerFile -BundleDir $testBundleDir -InstallerType nsis | Should -Match "setup.exe"
     }
 }
 
