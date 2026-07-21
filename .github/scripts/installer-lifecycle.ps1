@@ -294,22 +294,24 @@ function Select-UninstallEntry {
 function Resolve-InstalledExecutable {
     param(
         [Parameter(Mandatory = $true)]$Entry,
-        [Parameter(Mandatory = $true)][string]$BinaryName
+        [Parameter(Mandatory = $true)][string]$BinaryName,
+        [string]$TrustedInstallRoot = ""
     )
 
     $installLocation = [string]$Entry.InstallLocation
+    $rootCandidate = if ($installLocation) { $installLocation } else { $TrustedInstallRoot }
     $resolvedInstallLocation = ""
-    if ($installLocation) {
-        if (-not (Test-Path $installLocation -PathType Container)) {
-            throw "Declared InstallLocation does not exist: '$installLocation'."
+    if ($rootCandidate) {
+        if (-not (Test-Path $rootCandidate -PathType Container)) {
+            throw "Trusted install root does not exist: '$rootCandidate'."
         }
-        $resolvedInstallLocation = (Resolve-Path $installLocation).Path
+        $resolvedInstallLocation = (Resolve-Path $rootCandidate).Path
         $hits = @(Get-ChildItem -Path $resolvedInstallLocation -Recurse -Filter $BinaryName -File -ErrorAction Stop)
         if ($hits.Count -eq 1) {
             return $hits[0].FullName
         }
         if ($hits.Count -gt 1) {
-            throw "Multiple '$BinaryName' found under InstallLocation '$installLocation'."
+            throw "Multiple '$BinaryName' found under trusted install root '$rootCandidate'."
         }
     }
 
@@ -380,27 +382,33 @@ function Get-UninstallCommand {
         throw "NSIS uninstall entry has neither QuietUninstallString nor UninstallString."
     }
     $parsed = Split-CommandLine -CommandLine $command
-    $installLocation = [string]$Entry.InstallLocation
-    if ([string]::IsNullOrWhiteSpace($installLocation) -or -not (Test-Path $installLocation -PathType Container)) {
-        throw "NSIS uninstall metadata has no existing InstallLocation directory."
-    }
     if (-not (Test-Path $parsed.File -PathType Leaf)) {
         throw "NSIS uninstall executable does not exist: $($parsed.File)"
     }
-    $installRoot = (Resolve-Path $installLocation).Path
     $uninstaller = (Resolve-Path $parsed.File).Path
-    $relative = [System.IO.Path]::GetRelativePath($installRoot, $uninstaller)
-    if ([System.IO.Path]::IsPathRooted($relative) -or $relative -eq ".." -or $relative.StartsWith("..$([System.IO.Path]::DirectorySeparatorChar)")) {
-        throw "NSIS uninstall executable is outside InstallLocation: $uninstaller"
-    }
     if ([System.IO.Path]::GetFileName($uninstaller) -ine "uninstall.exe") {
-        throw "NSIS uninstall executable must be the validated uninstall.exe under InstallLocation."
+        throw "NSIS uninstall executable must be named uninstall.exe."
     }
+
+    $installLocation = [string]$Entry.InstallLocation
+    if ([string]::IsNullOrWhiteSpace($installLocation)) {
+        $installRoot = (Resolve-Path (Split-Path -Parent $uninstaller)).Path
+    } else {
+        if (-not (Test-Path $installLocation -PathType Container)) {
+            throw "NSIS uninstall metadata declares a missing InstallLocation directory."
+        }
+        $installRoot = (Resolve-Path $installLocation).Path
+        $relative = [System.IO.Path]::GetRelativePath($installRoot, $uninstaller)
+        if ([System.IO.Path]::IsPathRooted($relative) -or $relative -eq ".." -or $relative.StartsWith("..$([System.IO.Path]::DirectorySeparatorChar)")) {
+            throw "NSIS uninstall executable is outside InstallLocation: $uninstaller"
+        }
+    }
+
     $arguments = $parsed.Args
     if ($arguments -notmatch '(^|\s)/S(\s|$)') {
         $arguments = ($arguments + " /S").Trim()
     }
-    return @{ File = $uninstaller; Args = $arguments }
+    return @{ File = $uninstaller; Args = $arguments; InstallRoot = $installRoot }
 }
 
 function Assert-UninstallResidue {
@@ -637,9 +645,9 @@ function Invoke-InstallerLifecycle {
 
         $entry = Select-UninstallEntry -Entries @(Get-UninstallEntries) -ProductName $ProductName -InstallerType $InstallerType -ExcludedIdentities $beforeIdentities
         $entryIdentity = Get-UninstallEntryIdentity -Entry $entry
-        $installDir = [string]$entry.InstallLocation
         $command = Get-UninstallCommand -Entry $entry -InstallerType $InstallerType -LogDir $logDir
-        $exePath = Resolve-InstalledExecutable -Entry $entry -BinaryName $BinaryName
+        $installDir = if ($entry.InstallLocation) { [string]$entry.InstallLocation } else { [string]$command.InstallRoot }
+        $exePath = Resolve-InstalledExecutable -Entry $entry -BinaryName $BinaryName -TrustedInstallRoot $installDir
         if (-not $installDir) { $installDir = Split-Path -Parent $exePath }
         Write-Host "Installed executable: $exePath"
 
@@ -674,6 +682,9 @@ function Invoke-InstallerLifecycle {
                 }
                 if (-not $command) {
                     $command = Get-UninstallCommand -Entry $entry -InstallerType $InstallerType -LogDir $logDir
+                }
+                if (-not $installDir) {
+                    $installDir = if ($entry.InstallLocation) { [string]$entry.InstallLocation } else { [string]$command.InstallRoot }
                 }
                 Invoke-Uninstall -Command $command -EntryIdentity $entryIdentity -ExePath $exePath -TimeoutSeconds $UninstallTimeoutSeconds
             } catch {

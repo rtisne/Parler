@@ -130,6 +130,23 @@ Describe "Get-UninstallCommand" {
         { Get-UninstallCommand -Entry $entry -InstallerType msi -LogDir ([System.IO.Path]::GetTempPath()) } | Should -Throw
     }
 
+    It "infers the trusted NSIS install root from uninstall.exe when InstallLocation is absent" {
+        $installDir = New-TempDir
+        $logDir = New-TempDir
+        try {
+            $uninstaller = Join-Path $installDir "uninstall.exe"
+            New-Item -ItemType File -Path $uninstaller | Out-Null
+            $entry = [PSCustomObject]@{
+                QuietUninstallString = "`"$uninstaller`" /S"
+                InstallLocation = ""
+            }
+            $cmd = Get-UninstallCommand -Entry $entry -InstallerType nsis -LogDir $logDir
+            $cmd.InstallRoot | Should -Be (Resolve-Path $installDir).Path
+        } finally {
+            Remove-Item -Recurse -Force $installDir, $logDir -ErrorAction SilentlyContinue
+        }
+    }
+
     It "parses a trusted QuietUninstallString for NSIS" {
         $installDir = New-TempDir
         try {
@@ -220,6 +237,26 @@ Describe "Resolve-InstalledExecutable" {
             New-Item -ItemType File -Path $icon | Out-Null
             $entry = [PSCustomObject]@{ InstallLocation = $installDir; DisplayIcon = "$icon,0" }
             { Resolve-InstalledExecutable -Entry $entry -BinaryName "parler.exe" } | Should -Throw
+        } finally {
+            Remove-Item -Recurse -Force $outsideDir -ErrorAction SilentlyContinue
+        }
+    }
+
+    It "accepts DisplayIcon inside the inferred trusted NSIS root" {
+        $icon = Join-Path $installDir "parler.exe"
+        New-Item -ItemType File -Path $icon | Out-Null
+        $entry = [PSCustomObject]@{ InstallLocation = ""; DisplayIcon = "$icon,0" }
+        (Resolve-InstalledExecutable -Entry $entry -BinaryName "parler.exe" -TrustedInstallRoot $installDir) |
+            Should -Be (Resolve-Path $icon).Path
+    }
+
+    It "binds DisplayIcon to the inferred trusted NSIS root" {
+        $outsideDir = New-TempDir
+        try {
+            $icon = Join-Path $outsideDir "parler.exe"
+            New-Item -ItemType File -Path $icon | Out-Null
+            $entry = [PSCustomObject]@{ InstallLocation = ""; DisplayIcon = "$icon,0" }
+            { Resolve-InstalledExecutable -Entry $entry -BinaryName "parler.exe" -TrustedInstallRoot $installDir } | Should -Throw
         } finally {
             Remove-Item -Recurse -Force $outsideDir -ErrorAction SilentlyContinue
         }
