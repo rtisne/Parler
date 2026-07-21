@@ -54,10 +54,13 @@
 //! ## Recording Mode
 //!
 //! For UI key capture, a separate `KeyboardListener` is created on-demand and
-//! polled from a dedicated recording thread. Events are emitted to the frontend
-//! via Tauri's event system. The whole capture session lives behind a single
-//! [`RecordingState`] with an atomic claim (no concurrent double-start) and an
-//! idempotent teardown that also auto-expires (see [`MAX_RECORDING_DURATION`]).
+//! polled from a dedicated recording thread. The whole capture session lives
+//! behind a single [`RecordingState`] whose entire lifecycle — flag, listener,
+//! timestamp and per-session stop signal — is protected by *one* mutex, so its
+//! transitions are linearizable: a `claim` (no concurrent double-start), the
+//! `install_session` handoff, an idempotent `teardown`, and an autonomous
+//! stale-session expiry (see [`MAX_RECORDING_DURATION`]) driven by the recording
+//! loop itself so it fires even with no keyboard events.
 
 use handy_keys::{Hotkey, HotkeyId, HotkeyManager, HotkeyState, KeyboardListener};
 use log::{debug, error, info};
@@ -231,6 +234,89 @@ impl<Id: Copy + Eq + Hash> HotkeyRegistry<Id> {
             ManagerCategory::Passive => self.passive_ids.get(id),
         }
     }
+
+    /// Peek a binding's OS handle without mutating the registry.
+    ///
+    /// Lets a caller attempt the OS unregister *first* and only
+    /// [`remove`](Self::remove) the registry state once it succeeds (see
+    /// [`unregister_transactional`](Self::unregister_transactional)).
+    fn os_handle(&self, binding_id: &str) -> Option<(Id, ManagerCategory)> {
+        self.by_binding
+            .get(binding_id)
+            .map(|reg| (reg.id, reg.category))
+    }
+
+    /// Transactionally register (or replace) a binding.
+    ///
+    /// Ordering guarantees the previously valid registration for `binding_id`
+    /// survives any rejection:
+    ///
+    /// 1. re-registering the *exact* same combo for this binding is a no-op;
+    /// 2. an inter-manager collision is rejected before any OS or registry
+    ///    mutation (stage/check), so the old registration is untouched;
+    /// 3. the **new** combo is registered with the OS *first*, while any prior
+    ///    (distinct) combo for this binding stays live — if the OS rejects the
+    ///    new combo the old registry entry and OS hook are still intact;
+    /// 4. only once the new combo is live do we drop the prior registration and
+    ///    commit the new one (commit). The OS release of the old combo is
+    ///    best-effort: its id is already off the dispatch map, so a failure only
+    ///    leaks an inert OS hook and is logged rather than lost.
+    fn register_transactional(
+        &mut self,
+        binding_id: &str,
+        hotkey: Hotkey,
+        hotkey_string: &str,
+        category: ManagerCategory,
+        os_register: impl FnOnce(Hotkey) -> Result<Id, String>,
+        os_unregister: impl FnOnce(Id, ManagerCategory) -> Result<(), String>,
+    ) -> Result<(), String> {
+        // (1) Re-registering the exact same combo for this binding is a no-op.
+        if let Some(reg) = self.by_binding.get(binding_id) {
+            if reg.hotkey == hotkey {
+                return Ok(());
+            }
+        }
+
+        // (2) Reject a combo owned by a *different* binding before touching the OS
+        // or the registry, so a rejected registration changes nothing.
+        self.check_collision(&hotkey, binding_id)?;
+
+        // (3) Register the new combo first; a failure here leaves the old
+        // registration (registry entry + OS hook) fully intact.
+        let new_id = os_register(hotkey)?;
+
+        // (4) Commit: drop any prior registration for this binding, releasing its
+        // OS hook best-effort, then record the new one.
+        if let Some((old_id, old_category)) = self.remove(binding_id) {
+            if let Err(e) = os_unregister(old_id, old_category) {
+                error!(
+                    "Failed to release previous hotkey for '{}' after replacement: {}",
+                    binding_id, e
+                );
+            }
+        }
+
+        self.commit(binding_id, hotkey, hotkey_string, new_id, category);
+        Ok(())
+    }
+
+    /// Transactionally unregister a binding.
+    ///
+    /// The OS unregister runs *first*; the canonical registry state is dropped
+    /// only after it succeeds, so a failed OS unregister never leaves the
+    /// registry claiming a still-registered combo is free.
+    fn unregister_transactional(
+        &mut self,
+        binding_id: &str,
+        os_unregister: impl FnOnce(Id, ManagerCategory) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let Some((id, category)) = self.os_handle(binding_id) else {
+            return Ok(());
+        };
+        os_unregister(id, category)?;
+        self.remove(binding_id);
+        Ok(())
+    }
 }
 
 /// Commands that can be sent to the hotkey manager thread
@@ -267,97 +353,171 @@ struct RecordingSession {
     started_at: Instant,
     /// Per-session stop flag for the recording loop. Cleared on teardown so the
     /// exact loop bound to *this* session exits and no stale listener survives.
+    /// Also the identity token: a loop only touches the session whose `running`
+    /// flag it owns (see [`RecordingState::poll_for_loop`]).
     running: Arc<AtomicBool>,
+}
+
+/// Lifecycle phase of the settings-UI key capture, all transitions serialized by
+/// [`RecordingState`]'s single mutex.
+enum RecordingPhase {
+    /// No capture in progress.
+    Idle,
+    /// A slot has been claimed but the live session (its OS listener) is still
+    /// being set up. Carries the claim's generation so a teardown or a newer
+    /// claim during setup is detected by [`install_session`] and the stale
+    /// listener is dropped instead of installed.
+    Claimed(u64),
+    /// A live capture session.
+    Active(RecordingSession),
 }
 
 /// Single source of truth for the settings-UI key capture session.
 ///
-/// `is_recording` is the atomic guard: `claim` flips it `false → true` with a
-/// `compare_exchange`, so two concurrent `start_recording` calls can never both
-/// win. `session` holds the listener, timing and per-session stop flag. Every
-/// teardown path clears all of it, idempotently.
+/// The *entire* lifecycle lives behind one mutex, so the flag, listener, timing
+/// and per-session stop signal can never disagree: `claim → install_session →
+/// teardown/expiry` is a linearizable sequence of locked transitions rather than
+/// a split atomic-flag-plus-separate-mutex that races (a teardown clearing a
+/// session a concurrent claim just installed, or a claim installing a listener a
+/// concurrent teardown already cancelled). A monotonic `generation` disambiguates
+/// the claim → install handoff.
 struct RecordingState {
-    is_recording: AtomicBool,
-    session: Mutex<Option<RecordingSession>>,
+    inner: Mutex<RecordingInner>,
+}
+
+struct RecordingInner {
+    phase: RecordingPhase,
+    /// Monotonic claim counter; each [`claim`](RecordingState::claim) takes the
+    /// next value so an install/abort can prove it still owns its claim.
+    next_generation: u64,
+}
+
+/// One step for the recording loop, produced under the lock by
+/// [`RecordingState::poll_for_loop`].
+enum RecordingStep {
+    /// A key event for the frontend.
+    Event(handy_keys::KeyEvent),
+    /// Session still live, no event pending — the loop should idle briefly.
+    Idle,
+    /// The loop's session is gone (torn down, expired, or replaced); stop.
+    Stop,
 }
 
 impl RecordingState {
     fn new() -> Self {
         Self {
-            is_recording: AtomicBool::new(false),
-            session: Mutex::new(None),
+            inner: Mutex::new(RecordingInner {
+                phase: RecordingPhase::Idle,
+                next_generation: 0,
+            }),
         }
     }
 
-    /// Atomically claim the recording slot.
+    fn lock(&self) -> std::sync::MutexGuard<'_, RecordingInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Expire a live session that has outlived [`MAX_RECORDING_DURATION`],
+    /// returning whether it did. Runs under an already-held lock.
+    fn expire_locked(inner: &mut RecordingInner, now: Instant) -> bool {
+        if let RecordingPhase::Active(session) = &inner.phase {
+            if now.saturating_duration_since(session.started_at) >= MAX_RECORDING_DURATION {
+                session.running.store(false, Ordering::SeqCst);
+                inner.phase = RecordingPhase::Idle;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Atomically claim the recording slot, returning a generation token for the
+    /// subsequent [`install_session`](Self::install_session).
     ///
     /// A stale (expired) session is torn down first so a crashed recording can't
-    /// block new ones. Returns `Err` if another session is already active. The
-    /// `compare_exchange` makes this safe against concurrent double-start.
-    fn claim(&self) -> Result<(), String> {
-        self.expire_if_stale(Instant::now());
-        self.is_recording
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .map_err(|_| "Already recording".to_string())?;
-        Ok(())
+    /// block new ones. Returns `Err` if a claim or live session already exists.
+    /// `now` is injected so expiry is testable without sleeping.
+    fn claim(&self, now: Instant) -> Result<u64, String> {
+        let mut inner = self.lock();
+        Self::expire_locked(&mut inner, now);
+        match inner.phase {
+            RecordingPhase::Idle => {
+                let generation = inner.next_generation;
+                inner.next_generation = inner.next_generation.wrapping_add(1);
+                inner.phase = RecordingPhase::Claimed(generation);
+                Ok(generation)
+            }
+            _ => Err("Already recording".to_string()),
+        }
     }
 
     /// Release a claim taken by [`claim`](Self::claim) when session setup fails
-    /// before a session is installed.
-    fn abort_claim(&self) {
-        self.is_recording.store(false, Ordering::SeqCst);
+    /// before a session is installed. No-op if the claim was already superseded.
+    fn abort_claim(&self, generation: u64) {
+        let mut inner = self.lock();
+        if matches!(inner.phase, RecordingPhase::Claimed(g) if g == generation) {
+            inner.phase = RecordingPhase::Idle;
+        }
     }
 
-    /// Install the live session and return its per-session stop flag for the
-    /// recording loop. Must be called after a successful [`claim`](Self::claim).
+    /// Install the live session for a prior claim and return its per-session stop
+    /// flag for the recording loop.
+    ///
+    /// Returns `None` if the claim was already torn down (teardown/expiry) or
+    /// superseded by a newer claim during listener setup; the caller must then
+    /// drop the listener and not spawn a loop. `now` is injected for tests.
     fn install_session(
         &self,
+        generation: u64,
         binding_id: String,
         listener: Option<KeyboardListener>,
-    ) -> Arc<AtomicBool> {
-        let running = Arc::new(AtomicBool::new(true));
-        let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(RecordingSession {
-            listener,
-            binding_id,
-            started_at: Instant::now(),
-            running: Arc::clone(&running),
-        });
-        running
+        now: Instant,
+    ) -> Option<Arc<AtomicBool>> {
+        let mut inner = self.lock();
+        match inner.phase {
+            RecordingPhase::Claimed(g) if g == generation => {
+                let running = Arc::new(AtomicBool::new(true));
+                inner.phase = RecordingPhase::Active(RecordingSession {
+                    listener,
+                    binding_id,
+                    started_at: now,
+                    running: Arc::clone(&running),
+                });
+                Some(running)
+            }
+            _ => None,
+        }
     }
 
-    /// Fully and idempotently tear down any session: stop the loop, drop the
-    /// listener, and clear the flag, binding id, and timestamp.
+    /// Fully and idempotently tear down any session or claim: stop the loop,
+    /// drop the listener, and clear the flag, binding id, and timestamp.
     fn teardown(&self) {
-        self.is_recording.store(false, Ordering::SeqCst);
-        let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(session) = guard.as_ref() {
+        let mut inner = self.lock();
+        if let RecordingPhase::Active(session) = &inner.phase {
             session.running.store(false, Ordering::SeqCst);
         }
-        *guard = None;
+        inner.phase = RecordingPhase::Idle;
     }
 
-    /// If a session has outlived [`MAX_RECORDING_DURATION`], tear it down.
-    /// Returns whether an expiry-driven teardown happened. `now` is injected so
-    /// expiry is testable without sleeping.
-    fn expire_if_stale(&self, now: Instant) -> bool {
-        if !self.is_recording.load(Ordering::SeqCst) {
-            return false;
-        }
-        let stale = {
-            let guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
-            match guard.as_ref() {
-                Some(session) => {
-                    now.saturating_duration_since(session.started_at) >= MAX_RECORDING_DURATION
+    /// One watchdog + poll step for a recording loop bound to `running`.
+    ///
+    /// Runs the stale-session watchdog first, so an abandoned session expires
+    /// autonomously from the loop's own ticking even when no keyboard events ever
+    /// arrive. Then, only if this loop still owns the live session (identified by
+    /// its `running` flag — a session installed *after* a teardown belongs to a
+    /// different loop), returns the next key event if any. Returns
+    /// [`RecordingStep::Stop`] once the loop must exit.
+    fn poll_for_loop(&self, running: &Arc<AtomicBool>, now: Instant) -> RecordingStep {
+        let mut inner = self.lock();
+        Self::expire_locked(&mut inner, now);
+        match &inner.phase {
+            RecordingPhase::Active(session) if Arc::ptr_eq(&session.running, running) => {
+                match session.listener.as_ref().and_then(|l| l.try_recv()) {
+                    Some(event) => RecordingStep::Event(event),
+                    None => RecordingStep::Idle,
                 }
-                // Claimed but session not yet installed: mid-setup, not stale.
-                None => false,
             }
-        };
-        if stale {
-            self.teardown();
+            _ => RecordingStep::Stop,
         }
-        stale
     }
 
     /// Whether the UI is actively capturing keys for a new binding.
@@ -365,19 +525,15 @@ impl RecordingState {
     /// Returns false (and fully tears the session down) once the session has
     /// outlived [`MAX_RECORDING_DURATION`], so a frontend that never calls
     /// `stop_recording` can't leave global shortcuts suppressed or a stale
-    /// listener alive.
+    /// listener alive. A claim mid-setup still counts as capturing.
     fn is_capturing(&self) -> bool {
         self.is_capturing_at(Instant::now())
     }
 
     fn is_capturing_at(&self, now: Instant) -> bool {
-        if !self.is_recording.load(Ordering::SeqCst) {
-            return false;
-        }
-        if self.expire_if_stale(now) {
-            return false;
-        }
-        true
+        let mut inner = self.lock();
+        Self::expire_locked(&mut inner, now);
+        !matches!(inner.phase, RecordingPhase::Idle)
     }
 }
 
@@ -554,29 +710,35 @@ impl HandyKeysState {
             .parse()
             .map_err(|e| format!("Failed to parse hotkey '{}': {}", hotkey_string, e))?;
 
-        // If this binding is already registered (e.g. re-register without an
-        // explicit unregister), tear the old entry down first so the canonical
-        // registry never leaks a stale combo or OS registration.
-        if registry.by_binding.contains_key(binding_id) {
-            Self::do_unregister(registry, blocking_manager, passive_manager, binding_id)?;
-        }
-
-        // Atomically reject a combo already owned by another binding, in either
-        // registration order, before any OS manager is touched.
-        registry.check_collision(&hotkey, binding_id)?;
-
         let category = physical_category(binding_id);
-        let manager = match category {
-            ManagerCategory::Blocking => blocking_manager.unwrap_or(passive_manager),
-            ManagerCategory::Passive => passive_manager,
-        };
 
-        // On failure the registry is left untouched (commit runs only on success).
-        let id = manager
-            .register(hotkey)
-            .map_err(|e| format!("Failed to register hotkey: {}", e))?;
-
-        registry.commit(binding_id, hotkey, hotkey_string, id, category);
+        // Stage/check + commit-or-preserve is handled inside the registry: a
+        // collision or a failed OS registration leaves any prior registration for
+        // this binding intact (see [`HotkeyRegistry::register_transactional`]).
+        registry.register_transactional(
+            binding_id,
+            hotkey,
+            hotkey_string,
+            category,
+            |hk| {
+                let manager = match category {
+                    ManagerCategory::Blocking => blocking_manager.unwrap_or(passive_manager),
+                    ManagerCategory::Passive => passive_manager,
+                };
+                manager
+                    .register(hk)
+                    .map_err(|e| format!("Failed to register hotkey: {}", e))
+            },
+            |id, cat| {
+                let manager = match cat {
+                    ManagerCategory::Blocking => blocking_manager.unwrap_or(passive_manager),
+                    ManagerCategory::Passive => passive_manager,
+                };
+                manager
+                    .unregister(id)
+                    .map_err(|e| format!("Failed to unregister hotkey: {}", e))
+            },
+        )?;
 
         debug!(
             "Registered handy-keys shortcut: {} -> {:?} ({:?})",
@@ -585,24 +747,25 @@ impl HandyKeysState {
         Ok(())
     }
 
-    /// Unregister a hotkey, cleaning every registry map even if the OS
-    /// unregister errors.
+    /// Unregister a hotkey. The OS unregister runs first; the canonical registry
+    /// state is dropped only once it succeeds, so a failed OS unregister never
+    /// leaves the registry claiming a still-registered combo is free.
     fn do_unregister(
         registry: &mut HotkeyRegistry,
         blocking_manager: Option<&HotkeyManager>,
         passive_manager: &HotkeyManager,
         binding_id: &str,
     ) -> Result<(), String> {
-        if let Some((id, category)) = registry.remove(binding_id) {
+        registry.unregister_transactional(binding_id, |id, category| {
             let manager = match category {
                 ManagerCategory::Blocking => blocking_manager.unwrap_or(passive_manager),
                 ManagerCategory::Passive => passive_manager,
             };
             manager
                 .unregister(id)
-                .map_err(|e| format!("Failed to unregister hotkey: {}", e))?;
-            debug!("Unregistered handy-keys shortcut: {}", binding_id);
-        }
+                .map_err(|e| format!("Failed to unregister hotkey: {}", e))
+        })?;
+        debug!("Unregistered handy-keys shortcut: {}", binding_id);
         Ok(())
     }
 
@@ -645,19 +808,33 @@ impl HandyKeysState {
     /// rejected instead of replacing the live listener.
     pub fn start_recording(&self, app: &AppHandle, binding_id: String) -> Result<(), String> {
         // Atomic claim: rejects a concurrent double-start and expires a stale one.
-        self.recording.claim()?;
+        let generation = self.recording.claim(Instant::now())?;
 
         // Create a new keyboard listener for recording. If this fails we must
         // release the claim so recording isn't wedged "on" forever.
         let listener = match KeyboardListener::new() {
             Ok(l) => l,
             Err(e) => {
-                self.recording.abort_claim();
+                self.recording.abort_claim(generation);
                 return Err(format!("Failed to create keyboard listener: {}", e));
             }
         };
 
-        let running = self.recording.install_session(binding_id, Some(listener));
+        // Install the session. `None` means a concurrent teardown (stop_recording
+        // or expiry) cancelled this claim during listener setup: the listener is
+        // dropped here and no loop is spawned, leaving the state coherently idle.
+        let running = match self.recording.install_session(
+            generation,
+            binding_id,
+            Some(listener),
+            Instant::now(),
+        ) {
+            Some(running) => running,
+            None => {
+                debug!("handy-keys recording claim was cancelled during setup");
+                return Ok(());
+            }
+        };
 
         // Start a thread to emit key events to the frontend
         let app_clone = app.clone();
@@ -669,36 +846,39 @@ impl HandyKeysState {
         Ok(())
     }
 
-    /// Recording loop - emits key events to frontend during recording
+    /// Recording loop - emits key events to frontend during recording.
+    ///
+    /// Doubles as the session watchdog: every tick runs the stale-session expiry
+    /// under the lock (via [`RecordingState::poll_for_loop`]) so an abandoned
+    /// session is torn down after [`MAX_RECORDING_DURATION`] even if no keyboard
+    /// events ever arrive to drive it.
     fn recording_loop(app: AppHandle, running: Arc<AtomicBool>) {
         while running.load(Ordering::SeqCst) {
-            let event = {
-                let state = match app.try_state::<HandyKeysState>() {
-                    Some(s) => s,
-                    None => break,
-                };
-                let guard = state.recording.session.lock().ok();
-                guard.and_then(|g| g.as_ref()?.listener.as_ref()?.try_recv())
+            let step = match app.try_state::<HandyKeysState>() {
+                Some(state) => state.recording.poll_for_loop(&running, Instant::now()),
+                None => break,
             };
 
-            if let Some(key_event) = event {
-                // Convert to frontend-friendly format
-                let frontend_event = FrontendKeyEvent {
-                    modifiers: modifiers_to_strings(key_event.modifiers),
-                    key: key_event.key.map(|k| k.to_string().to_lowercase()),
-                    is_key_down: key_event.is_key_down,
-                    hotkey_string: key_event
-                        .as_hotkey()
-                        .map(|h| h.to_handy_string())
-                        .unwrap_or_default(),
-                };
+            match step {
+                RecordingStep::Event(key_event) => {
+                    // Convert to frontend-friendly format
+                    let frontend_event = FrontendKeyEvent {
+                        modifiers: modifiers_to_strings(key_event.modifiers),
+                        key: key_event.key.map(|k| k.to_string().to_lowercase()),
+                        is_key_down: key_event.is_key_down,
+                        hotkey_string: key_event
+                            .as_hotkey()
+                            .map(|h| h.to_handy_string())
+                            .unwrap_or_default(),
+                    };
 
-                // Emit to frontend
-                if let Err(e) = app.emit("handy-keys-event", &frontend_event) {
-                    error!("Failed to emit key event: {}", e);
+                    // Emit to frontend
+                    if let Err(e) = app.emit("handy-keys-event", &frontend_event) {
+                        error!("Failed to emit key event: {}", e);
+                    }
                 }
-            } else {
-                thread::sleep(Duration::from_millis(10));
+                RecordingStep::Idle => thread::sleep(Duration::from_millis(10)),
+                RecordingStep::Stop => break,
             }
         }
 
@@ -1077,62 +1257,400 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Recording session lifecycle (no real OS hooks: `listener: None`).
+    // Transactional register/replace and unregister (mock OS via closures).
+    // These exercise the stage/check → commit-or-preserve ordering without a
+    // real `HotkeyManager` (whose `HotkeyId` cannot be constructed here).
     // ---------------------------------------------------------------------
+
+    #[test]
+    fn reregistering_same_combo_is_noop() {
+        let mut registry = HotkeyRegistry::<u32>::default();
+        let combo = hotkey("ctrl+space");
+        registry.commit(
+            "transcribe",
+            combo,
+            "ctrl+space",
+            1,
+            ManagerCategory::Blocking,
+        );
+
+        // An identical re-registration must not touch the OS at all.
+        registry
+            .register_transactional(
+                "transcribe",
+                combo,
+                "ctrl+space",
+                ManagerCategory::Blocking,
+                |_| panic!("no OS register for an identical re-registration"),
+                |_, _| panic!("no OS unregister for an identical re-registration"),
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .dispatch_target(ManagerCategory::Blocking, &1)
+                .map(|(b, _)| b.as_str()),
+            Some("transcribe")
+        );
+    }
+
+    #[test]
+    fn replacement_colliding_with_other_binding_preserves_old() {
+        let mut registry = HotkeyRegistry::<u32>::default();
+        let a = hotkey("ctrl+space");
+        let b = hotkey("ctrl+alt+p");
+        registry.commit("transcribe", a, "ctrl+space", 1, ManagerCategory::Blocking);
+        registry.commit("pause", b, "ctrl+alt+p", 2, ManagerCategory::Passive);
+
+        // "transcribe" tries to move onto "pause"'s combo: rejected up front, so
+        // neither the OS nor the registry is touched.
+        let res = registry.register_transactional(
+            "transcribe",
+            b,
+            "ctrl+alt+p",
+            ManagerCategory::Blocking,
+            |_| panic!("OS register must not run on a rejected collision"),
+            |_, _| panic!("OS unregister must not run on a rejected collision"),
+        );
+        assert!(res.is_err());
+
+        // "transcribe" still owns its original combo and dispatches to its id.
+        assert_eq!(
+            registry.by_hotkey.get(&a).map(String::as_str),
+            Some("transcribe")
+        );
+        assert_eq!(
+            registry
+                .dispatch_target(ManagerCategory::Blocking, &1)
+                .map(|(x, _)| x.as_str()),
+            Some("transcribe")
+        );
+    }
+
+    #[test]
+    fn failed_replacement_registration_preserves_old_binding() {
+        let mut registry = HotkeyRegistry::<u32>::default();
+        let old = hotkey("ctrl+space");
+        let new = hotkey("ctrl+alt+p");
+        registry.commit(
+            "transcribe",
+            old,
+            "ctrl+space",
+            1,
+            ManagerCategory::Blocking,
+        );
+
+        // The new combo passes the collision check but the OS registration fails.
+        let res = registry.register_transactional(
+            "transcribe",
+            new,
+            "ctrl+alt+p",
+            ManagerCategory::Blocking,
+            |_| Err("os rejected".to_string()),
+            |_, _| panic!("old registration must be preserved, not released, on failure"),
+        );
+        assert!(res.is_err());
+
+        // The old registration — combo, dispatch id, and canonical ownership — is
+        // fully intact; the new combo was never recorded.
+        assert_eq!(
+            registry.by_hotkey.get(&old).map(String::as_str),
+            Some("transcribe")
+        );
+        assert!(registry.by_hotkey.get(&new).is_none());
+        assert_eq!(
+            registry
+                .dispatch_target(ManagerCategory::Blocking, &1)
+                .map(|(b, _)| b.as_str()),
+            Some("transcribe")
+        );
+    }
+
+    #[test]
+    fn successful_replacement_swaps_combo_and_releases_old() {
+        let mut registry = HotkeyRegistry::<u32>::default();
+        let old = hotkey("ctrl+space");
+        let new = hotkey("ctrl+alt+p");
+        registry.commit(
+            "transcribe",
+            old,
+            "ctrl+space",
+            1,
+            ManagerCategory::Blocking,
+        );
+
+        let mut released = None;
+        registry
+            .register_transactional(
+                "transcribe",
+                new,
+                "ctrl+alt+p",
+                ManagerCategory::Blocking,
+                |_| Ok(2u32),
+                |id, cat| {
+                    released = Some((id, cat));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        // The old combo is released from the OS only after the new one is live.
+        assert_eq!(released, Some((1, ManagerCategory::Blocking)));
+        assert!(registry.by_hotkey.get(&old).is_none());
+        assert_eq!(
+            registry.by_hotkey.get(&new).map(String::as_str),
+            Some("transcribe")
+        );
+        assert_eq!(
+            registry
+                .dispatch_target(ManagerCategory::Blocking, &2)
+                .map(|(b, _)| b.as_str()),
+            Some("transcribe")
+        );
+        assert!(registry
+            .dispatch_target(ManagerCategory::Blocking, &1)
+            .is_none());
+    }
+
+    #[test]
+    fn failed_os_unregister_keeps_registry_entry() {
+        let mut registry = HotkeyRegistry::<u32>::default();
+        let combo = hotkey("ctrl+space");
+        registry.commit(
+            "transcribe",
+            combo,
+            "ctrl+space",
+            1,
+            ManagerCategory::Blocking,
+        );
+
+        // The OS unregister fails: the canonical registry must retain the entry so
+        // it never claims a still-registered combo is free.
+        let res =
+            registry.unregister_transactional("transcribe", |_, _| Err("os busy".to_string()));
+        assert!(res.is_err());
+        assert_eq!(
+            registry.by_hotkey.get(&combo).map(String::as_str),
+            Some("transcribe")
+        );
+        assert!(registry.os_handle("transcribe").is_some());
+        // A different binding still cannot claim the combo.
+        assert!(registry.check_collision(&combo, "pause").is_err());
+    }
+
+    #[test]
+    fn successful_os_unregister_frees_combo() {
+        let mut registry = HotkeyRegistry::<u32>::default();
+        let combo = hotkey("ctrl+space");
+        registry.commit(
+            "transcribe",
+            combo,
+            "ctrl+space",
+            1,
+            ManagerCategory::Blocking,
+        );
+
+        registry
+            .unregister_transactional("transcribe", |id, cat| {
+                assert_eq!((id, cat), (1, ManagerCategory::Blocking));
+                Ok(())
+            })
+            .unwrap();
+        assert!(registry.by_hotkey.get(&combo).is_none());
+        assert!(registry.os_handle("transcribe").is_none());
+        assert!(registry.check_collision(&combo, "pause").is_ok());
+    }
+
+    #[test]
+    fn unregister_unknown_binding_is_ok() {
+        let mut registry = HotkeyRegistry::<u32>::default();
+        registry
+            .unregister_transactional("missing", |_, _| panic!("no OS call for unknown binding"))
+            .unwrap();
+    }
+
+    // ---------------------------------------------------------------------
+    // Recording session lifecycle (no real OS hooks: `listener: None`).
+    // The whole lifecycle is behind one mutex, so transitions are linearizable.
+    // ---------------------------------------------------------------------
+
+    /// Claim and install a fresh session, returning its per-session stop flag.
+    fn claim_and_install(state: &RecordingState, binding: &str) -> Arc<AtomicBool> {
+        let generation = state.claim(Instant::now()).expect("claim succeeds");
+        state
+            .install_session(generation, binding.into(), None, Instant::now())
+            .expect("install succeeds for a fresh claim")
+    }
 
     #[test]
     fn rejects_concurrent_double_start() {
         let state = RecordingState::new();
-        state.claim().expect("first claim succeeds");
-        // A concurrent second claim must be rejected, not replace the session.
-        assert!(state.claim().is_err());
+        let _g = state.claim(Instant::now()).expect("first claim succeeds");
+        // A second claim while one is in flight must be rejected, not replace it.
+        assert!(state.claim(Instant::now()).is_err());
+    }
+
+    #[test]
+    fn teardown_between_claim_and_install_drops_stale_listener() {
+        let state = RecordingState::new();
+        let generation = state.claim(Instant::now()).expect("claim");
+
+        // A teardown races in after the claim but before the session is installed.
+        state.teardown();
+
+        // The now-stale install must be refused, so the listener is dropped rather
+        // than installed while the lifecycle believes it is idle.
+        assert!(state
+            .install_session(generation, "transcribe".into(), None, Instant::now())
+            .is_none());
+        assert!(!state.is_capturing());
+        // The slot is coherently free to claim again.
+        assert!(state.claim(Instant::now()).is_ok());
+    }
+
+    #[test]
+    fn install_for_superseded_claim_is_refused() {
+        let state = RecordingState::new();
+        let stale = state.claim(Instant::now()).expect("first claim");
+        state.teardown();
+        // A newer claim takes a fresh generation.
+        let _fresh = state.claim(Instant::now()).expect("second claim");
+
+        // The stale claim's install must not clobber the newer claim.
+        assert!(state
+            .install_session(stale, "transcribe".into(), None, Instant::now())
+            .is_none());
     }
 
     #[test]
     fn expiry_fully_and_idempotently_cleans_session() {
         let state = RecordingState::new();
-        state.claim().unwrap();
-        state.install_session("transcribe".into(), None);
+        let running = claim_and_install(&state, "transcribe");
 
         // A fresh session is still capturing.
         assert!(state.is_capturing_at(Instant::now()));
 
-        // Past the max duration, capture expires AND everything is cleared, so
-        // no stale listener/flag survives while global actions resume.
+        // Past the max duration, capture expires AND everything is cleared, so no
+        // stale listener/flag survives while global actions resume.
         let future = Instant::now() + MAX_RECORDING_DURATION + Duration::from_secs(1);
         assert!(!state.is_capturing_at(future));
-        assert!(!state.is_recording.load(Ordering::SeqCst));
-        assert!(state.session.lock().unwrap().is_none());
-
+        assert!(!running.load(Ordering::SeqCst), "expiry stops the loop");
         // A new session can be claimed again after expiry.
-        assert!(state.claim().is_ok());
+        assert!(state.claim(Instant::now()).is_ok());
+    }
+
+    #[test]
+    fn watchdog_expires_session_without_any_events() {
+        let state = RecordingState::new();
+        let running = claim_and_install(&state, "transcribe");
+
+        // A fresh poll keeps the loop alive (idle: no listener, no event).
+        assert!(matches!(
+            state.poll_for_loop(&running, Instant::now()),
+            RecordingStep::Idle
+        ));
+
+        // Past the max duration the watchdog tears the session down from the
+        // loop's own tick — no keyboard event and no `is_capturing()` call needed.
+        let future = Instant::now() + MAX_RECORDING_DURATION + Duration::from_secs(1);
+        assert!(matches!(
+            state.poll_for_loop(&running, future),
+            RecordingStep::Stop
+        ));
+        assert!(!running.load(Ordering::SeqCst), "watchdog stopped the loop");
+        assert!(!state.is_capturing());
+    }
+
+    #[test]
+    fn poll_for_loop_stops_superseded_loop() {
+        let state = RecordingState::new();
+        let old = claim_and_install(&state, "transcribe");
+        state.teardown();
+        let new = claim_and_install(&state, "pause");
+
+        // The old loop must stop — it no longer owns the live session ...
+        assert!(matches!(
+            state.poll_for_loop(&old, Instant::now()),
+            RecordingStep::Stop
+        ));
+        // ... while the loop that owns the current session keeps running.
+        assert!(matches!(
+            state.poll_for_loop(&new, Instant::now()),
+            RecordingStep::Idle
+        ));
     }
 
     #[test]
     fn teardown_clears_all_state() {
         let state = RecordingState::new();
-        state.claim().unwrap();
-        let running = state.install_session("pause".into(), None);
+        let running = claim_and_install(&state, "pause");
 
         state.teardown();
 
-        assert!(!state.is_recording.load(Ordering::SeqCst));
         assert!(!running.load(Ordering::SeqCst), "loop stop flag cleared");
-        assert!(state.session.lock().unwrap().is_none());
+        assert!(!state.is_capturing());
     }
 
     #[test]
     fn teardown_is_idempotent() {
         let state = RecordingState::new();
-        state.claim().unwrap();
-        state.install_session("pause".into(), None);
+        let _running = claim_and_install(&state, "pause");
 
         state.teardown();
         // A second teardown must not panic and must leave clean state.
         state.teardown();
 
-        assert!(!state.is_recording.load(Ordering::SeqCst));
-        assert!(state.session.lock().unwrap().is_none());
         assert!(!state.is_capturing());
+        assert!(state.claim(Instant::now()).is_ok());
+    }
+
+    #[test]
+    fn concurrent_teardown_and_claim_never_corrupt_state() {
+        use std::sync::Barrier;
+
+        // Hammer the claim↔teardown boundary from two real threads. With the
+        // single-mutex lifecycle this can only ever settle into a coherent phase;
+        // the old split AtomicBool + Mutex design could leave "recording = true"
+        // with no session (or a live listener with recording = false).
+        for _ in 0..500 {
+            let state = Arc::new(RecordingState::new());
+            // Start from a live session that the teardown thread will tear down
+            // while the claim thread races to start a fresh one.
+            let _ = claim_and_install(&state, "transcribe");
+
+            let barrier = Arc::new(Barrier::new(2));
+
+            let s1 = Arc::clone(&state);
+            let b1 = Arc::clone(&barrier);
+            let t_teardown = thread::spawn(move || {
+                b1.wait();
+                s1.teardown();
+            });
+
+            let s2 = Arc::clone(&state);
+            let b2 = Arc::clone(&barrier);
+            let t_claim = thread::spawn(move || {
+                b2.wait();
+                // May win (teardown already ran) or lose (session still live);
+                // both outcomes are valid. On a win, complete the install handoff.
+                if let Ok(generation) = s2.claim(Instant::now()) {
+                    s2.install_session(generation, "pause".into(), None, Instant::now());
+                }
+            });
+
+            t_teardown.join().unwrap();
+            t_claim.join().unwrap();
+
+            // Invariant: `is_capturing()` and the actual phase always agree — the
+            // flag can never be set with a missing session, or vice versa.
+            let capturing = state.is_capturing();
+            let inner = state.lock();
+            match &inner.phase {
+                RecordingPhase::Idle => assert!(!capturing),
+                RecordingPhase::Claimed(_) | RecordingPhase::Active(_) => assert!(capturing),
+            }
+            drop(inner);
+
+            state.teardown();
+        }
     }
 }
