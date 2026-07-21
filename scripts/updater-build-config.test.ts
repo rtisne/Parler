@@ -54,6 +54,15 @@ describe("unsigned build updater configuration", () => {
     expect(disableStep).toContain(
       "!inputs.sign-binaries || steps.signing-check.outputs.has-signing-key != 'true'",
     );
+    expect(disableStep).toContain("PARLER_UPDATER_ENABLED=false");
+
+    const rustApplication = readFileSync(
+      resolve(import.meta.dir, "../src-tauri/src/lib.rs"),
+      "utf8",
+    );
+    expect(rustApplication).toMatch(
+      /if updater_enabled_from_build_flag\(option_env!\("PARLER_UPDATER_ENABLED"\)\)\s*\{\s*builder = builder\.plugin\(tauri_plugin_updater::Builder::new\(\)\.build\(\)\);\s*\}/s,
+    );
   });
 
   test("removes the updater plugin configuration instead of leaving it without a pubkey", () => {
