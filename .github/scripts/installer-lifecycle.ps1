@@ -139,7 +139,7 @@ function Register-ProcessJob {
     Initialize-ProcessJobApi
     $job = [ParlerProcessJob]::CreateKillOnClose()
     try {
-        [ParlerProcessJob]::Assign($job, $Process.Id)
+        [ParlerProcessJob]::Assign($job, [int]$Process.Id)
         $Process | Add-Member -MemberType NoteProperty -Name ParlerJobHandle -Value $job -Force
         return $Process
     } catch {
@@ -148,6 +148,11 @@ function Register-ProcessJob {
         throw "Could not place process $($Process.Id) in a kill-on-close Windows Job Object: $($_.Exception.Message)"
     }
 }
+
+# Compile the native bridge before the first process is launched. Compiling it
+# inside Register-ProcessJob creates a race where a short-lived root can exit
+# (and detach children) while Add-Type is still running.
+if ($IsWindows) { Initialize-ProcessJobApi }
 
 function Stop-ProcessTree {
     param([Parameter(Mandatory = $true)]$Process)
