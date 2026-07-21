@@ -20,6 +20,7 @@
     "test:playwright:ui": "playwright test --ui",
     "test:translations": "bun test scripts/check-translations.test.ts",
     "test:build-config": "bun test scripts/updater-build-config.test.ts",
+    "test:ci-structure": "bun test scripts/windows-only-ci.test.ts",
     "check:translations": "bun scripts/check-translations.ts"
   },
   "dependencies": {

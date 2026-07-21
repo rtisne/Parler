@@ -10,7 +10,7 @@ jobs:
   create-release:
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     outputs:
       release-id: ${{ steps.create-release.outputs.result }}
       version: ${{ steps.get-version.outputs.version }}
@@ -135,11 +135,9 @@ jobs:
           - platform: "windows-latest" # Windows x64
             args: "--bundles nsis,msi"
             target: "x86_64-pc-windows-msvc"
-            apple_signing: false
           - platform: "windows-11-arm" # Windows ARM64
             args: "--bundles nsis,msi"
             target: "aarch64-pc-windows-msvc"
-            apple_signing: false
 
     uses: ./.github/workflows/build.yml
     with:
@@ -147,7 +145,6 @@ jobs:
       target: ${{ matrix.target }}
       build-args: ${{ matrix.args }}
       sign-binaries: false
-      apple_signing: ${{ matrix.apple_signing }}
       asset-prefix: "parler"
       upload-artifacts: false
       release-id: ${{ needs.create-release.outputs.release-id }}
@@ -157,7 +154,7 @@ jobs:
   publish-release:
     permissions:
       contents: write
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     needs: [create-release, publish-tauri]
     if: ${{ !cancelled() && needs.create-release.result == 'success' && needs.publish-tauri.result == 'success' }}
     steps:

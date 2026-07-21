@@ -32,10 +32,6 @@ on:
         required: false
         type: boolean
         default: false
-      apple_signing:
-        required: false
-        type: boolean
-        default: true
       repository:
         required: false
         type: string
@@ -82,21 +78,18 @@ jobs:
           fi
 
       - name: Setup Bun (standard)
-        if: ${{ !(contains(inputs.platform, 'windows') && contains(inputs.target, 'aarch64')) }}
+        if: ${{ !contains(inputs.target, 'aarch64') }}
         uses: oven-sh/setup-bun@v2
 
       # Native Windows ARM64 builds are available since Bun 1.3.10.
       - name: Setup Bun (Windows ARM64)
-        if: ${{ contains(inputs.platform, 'windows') && contains(inputs.target, 'aarch64') }}
+        if: ${{ contains(inputs.target, 'aarch64') }}
         uses: oven-sh/setup-bun@v2
         with:
           bun-download-url: "https://github.com/oven-sh/bun/releases/latest/download/bun-windows-aarch64.zip"
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
-        with:
-          # Those targets are only used on macos runners so it's in an `if` to slightly speed up windows and linux builds.
-          targets: ${{ contains(inputs.platform, 'macos') && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - name: Rust cache
         uses: swatinem/rust-cache@v2
@@ -105,47 +98,15 @@ jobs:
           key: ${{ inputs.platform }}-${{ inputs.target }}
 
       - name: Setup OpenBLAS (Windows)
-        if: contains(inputs.platform, 'windows')
         shell: pwsh
         run: ./.github/scripts/setup-openblas.ps1 -Target "${{ inputs.target }}"
 
       - name: Install pkg-config (Windows)
-        if: contains(inputs.platform, 'windows')
         shell: pwsh
         run: ./.github/scripts/setup-pkgconf.ps1 -Target "${{ inputs.target }}"
 
-      - name: install dependencies (ubuntu 24.04 x64)
-        if: contains(inputs.platform, 'ubuntu-24.04') && !contains(inputs.platform, 'arm')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libappindicator3-dev librsvg2-dev patchelf libasound2-dev libopenblas-dev libx11-dev libxtst-dev libxrandr-dev libgtk-layer-shell0 libgtk-layer-shell-dev \
-            libwebkit2gtk-4.1-0=2.44.0-2 \
-            libwebkit2gtk-4.1-dev=2.44.0-2 \
-            libjavascriptcoregtk-4.1-0=2.44.0-2 \
-            libjavascriptcoregtk-4.1-dev=2.44.0-2 \
-            gir1.2-javascriptcoregtk-4.1=2.44.0-2 \
-            gir1.2-webkit2-4.1=2.44.0-2
-
-      - name: install dependencies (ubuntu 24.04 arm64)
-        if: contains(inputs.platform, 'ubuntu-24.04-arm')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev libopenblas-dev libx11-dev libxtst-dev libxrandr-dev libgtk-layer-shell0 libgtk-layer-shell-dev xdg-utils
-
-      - name: install dependencies (ubuntu 22.04)
-        if: contains(inputs.platform, 'ubuntu-22.04') && !contains(inputs.platform, 'arm')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev libopenblas-dev libx11-dev libxtst-dev libxrandr-dev libgtk-layer-shell0 libgtk-layer-shell-dev
-
-      - name: Verify gtk-layer-shell runtime dependency (Ubuntu)
-        if: contains(inputs.platform, 'ubuntu')
-        run: |
-          dpkg-query -W -f='${Status}\n' libgtk-layer-shell0 | grep -q "install ok installed"
-          ldconfig -p | grep -q "libgtk-layer-shell.so.0"
-
       - name: Install Vulkan SDK (Windows x64)
-        if: contains(inputs.platform, 'windows') && !contains(inputs.target, 'aarch64')
+        if: ${{ !contains(inputs.target, 'aarch64') }}
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
           version: 1.4.309.0
@@ -155,7 +116,7 @@ jobs:
       # Download prebuilt binaries (Bin) + build headers/libs from source.
       # See https://github.com/humbletim/install-vulkan-sdk/pull/22 for prebuilt ARM64 support progress.
       - name: Prepare Vulkan SDK env (Windows ARM64)
-        if: contains(inputs.platform, 'windows') && contains(inputs.target, 'aarch64')
+        if: ${{ contains(inputs.target, 'aarch64') }}
         shell: pwsh
         run: |
           $sdkDir = Join-Path $env:GITHUB_WORKSPACE "VULKAN_SDK"
@@ -163,7 +124,7 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "VULKAN_SDK=$sdkDir"
 
       - name: Download Vulkan SDK binaries (Windows ARM64)
-        if: contains(inputs.platform, 'windows') && contains(inputs.target, 'aarch64')
+        if: ${{ contains(inputs.target, 'aarch64') }}
         shell: pwsh
         run: |
           $url = "https://sdk.lunarg.com/sdk/download/1.4.309.0/warm/InstallVulkanARM64-1.4.309.0.exe"
@@ -172,7 +133,7 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $outFile
 
       - name: Extract Vulkan SDK binaries (Windows ARM64)
-        if: contains(inputs.platform, 'windows') && contains(inputs.target, 'aarch64')
+        if: ${{ contains(inputs.target, 'aarch64') }}
         shell: pwsh
         run: |
           $sdkDir = $env:VULKAN_SDK
@@ -185,7 +146,7 @@ jobs:
           & (Join-Path $binPath "glslc.exe") --version
 
       - name: Build Vulkan SDK headers and libs (Windows ARM64)
-        if: contains(inputs.platform, 'windows') && contains(inputs.target, 'aarch64')
+        if: ${{ contains(inputs.target, 'aarch64') }}
         uses: humbletim/setup-vulkan-sdk@v1.2.1
         with:
           vulkan-query-version: 1.4.309.0
@@ -196,12 +157,6 @@ jobs:
         id: signing-check
         shell: bash
         run: |
-          if [[ -n "$APPLE_CERT" ]]; then
-            echo "has-apple-cert=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has-apple-cert=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️ Apple certificate not configured"
-          fi
           if [[ -n "$AZURE_ID" ]]; then
             echo "has-azure-signing=true" >> "$GITHUB_OUTPUT"
           else
@@ -215,16 +170,15 @@ jobs:
             echo "⚠️ Tauri updater signing key not configured"
           fi
         env:
-          APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE }}
           AZURE_ID: ${{ secrets.AZURE_CLIENT_ID }}
           SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
 
       - name: Install trusted-signing-cli
-        if: contains(inputs.platform, 'windows') && inputs.sign-binaries && steps.signing-check.outputs.has-azure-signing == 'true'
+        if: inputs.sign-binaries && steps.signing-check.outputs.has-azure-signing == 'true'
         run: cargo install trusted-signing-cli
 
       - name: Configure Windows code signing
-        if: contains(inputs.platform, 'windows') && inputs.sign-binaries && steps.signing-check.outputs.has-azure-signing == 'true'
+        if: inputs.sign-binaries && steps.signing-check.outputs.has-azure-signing == 'true'
         shell: bash
         env:
           SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
@@ -249,72 +203,13 @@ jobs:
           export SIGN_CMD
           node -e 'var fs=require("fs"),c=JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json","utf8"));if(!c.bundle)c.bundle={};if(!c.bundle.windows)c.bundle.windows={};c.bundle.windows.signCommand=process.env.SIGN_CMD;fs.writeFileSync("src-tauri/tauri.conf.json",JSON.stringify(c,null,2)+"\n");console.log("signCommand configured:",c.bundle.windows.signCommand);'
 
-      - name: Prepare Vulkan SDK for Ubuntu 24.04
-        if: contains(inputs.platform, 'ubuntu-24.04') && !contains(inputs.platform, 'arm')
-        run: |
-          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.3.290-noble.list https://packages.lunarg.com/vulkan/1.3.290/lunarg-vulkan-1.3.290-noble.list
-          sudo apt update
-          sudo apt install vulkan-sdk -y
-          sudo apt-get install -y mesa-vulkan-drivers
-
-      - name: Prepare Vulkan SDK for Ubuntu ARM64
-        if: contains(inputs.platform, 'ubuntu') && contains(inputs.platform, 'arm')
-        uses: jakoch/install-vulkan-sdk-action@v1
-        with:
-          vulkan_version: 1.4.335.0
-          cache: true
-
-      - name: Install Vulkan runtime libraries (Ubuntu ARM64)
-        if: contains(inputs.platform, 'ubuntu') && contains(inputs.platform, 'arm')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libvulkan-dev mesa-vulkan-drivers
-
-      - name: Prepare Vulkan SDK for Ubuntu 22.04
-        if: contains(inputs.platform, 'ubuntu-22.04') && !contains(inputs.platform, 'arm')
-        run: |
-          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-1.3.290-jammy.list https://packages.lunarg.com/vulkan/1.3.290/lunarg-vulkan-1.3.290-jammy.list
-          sudo apt update
-          sudo apt install vulkan-sdk -y
-          sudo apt-get install -y mesa-vulkan-drivers
-
       - name: install frontend dependencies
-        if: ${{ !(contains(inputs.platform, 'windows') && contains(inputs.target, 'aarch64')) }}
-        run: bun install --frozen-lockfile
-
-      - name: install frontend dependencies (Windows ARM64)
-        if: ${{ contains(inputs.platform, 'windows') && contains(inputs.target, 'aarch64') }}
         run: bun install --frozen-lockfile
 
       - name: rustup install target
-        if: ${{ inputs.target != '' && !contains(inputs.target, 'x86_64-unknown-linux-gnu') && !contains(inputs.target, 'aarch64-unknown-linux-gnu') && !contains(inputs.target, 'x86_64-pc-windows-msvc') }}
+        if: ${{ inputs.target != '' }}
         run: rustup target add ${{ inputs.target }}
 
-      - name: import Apple Developer Certificate
-        if: contains(inputs.platform, 'macos') && inputs.sign-binaries && steps.signing-check.outputs.has-apple-cert == 'true'
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-        run: |
-          echo $APPLE_CERTIFICATE | base64 --decode > certificate.p12
-          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security default-keychain -s build.keychain
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
-          security set-keychain-settings -t 3600 -u build.keychain
-          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
-          security find-identity -v -p codesigning build.keychain
-
-      - name: verify certificate
-        if: contains(inputs.platform, 'macos') && inputs.sign-binaries && steps.signing-check.outputs.has-apple-cert == 'true'
-        run: |
-          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application")
-          CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
-          echo "CERT_ID=$CERT_ID" >> $GITHUB_ENV
-          echo "Certificate imported."
       - name: Patch asset name pattern
         id: patch-release-name
         shell: bash
@@ -352,41 +247,12 @@ jobs:
           node -e 'var fs=require("fs"),c=JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json","utf8"));if(!c.bundle)c.bundle={};c.bundle.createUpdaterArtifacts=false;if(c.plugins)delete c.plugins.updater;fs.writeFileSync("src-tauri/tauri.conf.json",JSON.stringify(c,null,2)+"\n");console.log("createUpdaterArtifacts disabled, updater plugin configuration removed");'
 
       - name: Build with Tauri
-        if: inputs.apple_signing
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ env.CERT_ID }}
-          AZURE_CLIENT_ID: ${{ inputs.sign-binaries && secrets.AZURE_CLIENT_ID || '' }}
-          AZURE_CLIENT_SECRET: ${{ inputs.sign-binaries && secrets.AZURE_CLIENT_SECRET || '' }}
-          AZURE_TENANT_ID: ${{ inputs.sign-binaries && secrets.AZURE_TENANT_ID || '' }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ inputs.sign-binaries && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ inputs.sign-binaries && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
-          WHISPER_NO_AVX: ${{ contains(inputs.platform, 'ubuntu') && !contains(inputs.platform, 'arm') && 'ON' || '' }}
-          WHISPER_NO_AVX2: ${{ contains(inputs.platform, 'ubuntu') && !contains(inputs.platform, 'arm') && 'ON' || '' }}
-        with:
-          tagName: ${{ inputs.release-id && format('v{0}', steps.get-version.outputs.version) || '' }}
-          releaseName: ${{ inputs.release-id && format('v{0}', steps.get-version.outputs.version) || '' }}
-          releaseId: ${{ inputs.release-id }}
-          assetNamePattern: ${{ steps.patch-release-name.outputs.platform }}
-          args: ${{ inputs.build-args }}
-
-      - name: Build with Tauri
-        if: ${{ !inputs.apple_signing }}
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AZURE_CLIENT_ID: ${{ inputs.sign-binaries && secrets.AZURE_CLIENT_ID || '' }}
           AZURE_CLIENT_SECRET: ${{ inputs.sign-binaries && secrets.AZURE_CLIENT_SECRET || '' }}
           AZURE_TENANT_ID: ${{ inputs.sign-binaries && secrets.AZURE_TENANT_ID || '' }}
-          WHISPER_NO_AVX: ${{ contains(inputs.platform, 'ubuntu') && !contains(inputs.platform, 'arm') && 'ON' || '' }}
-          WHISPER_NO_AVX2: ${{ contains(inputs.platform, 'ubuntu') && !contains(inputs.platform, 'arm') && 'ON' || '' }}
         with:
           tagName: ${{ inputs.release-id && format('v{0}', steps.get-version.outputs.version) || '' }}
           releaseName: ${{ inputs.release-id && format('v{0}', steps.get-version.outputs.version) || '' }}
@@ -395,14 +261,12 @@ jobs:
           args: ${{ inputs.build-args }}
 
       - name: Smoke test Windows application startup
-        if: contains(inputs.platform, 'windows')
         shell: pwsh
         run: |
           ./.github/scripts/smoke-test-windows-startup.ps1 `
             -BinaryPath "${{ contains(inputs.build-args, '--target') && format('src-tauri/target/{0}/{1}/parler.exe', inputs.target, steps.build-profile.outputs.profile) || format('src-tauri/target/{0}/parler.exe', steps.build-profile.outputs.profile) }}"
 
       - name: Verify staged OpenBLAS runtime (Windows)
-        if: contains(inputs.platform, 'windows')
         shell: pwsh
         run: |
           $required = @("src-tauri/openblas-libs/libopenblas.dll")
@@ -420,86 +284,31 @@ jobs:
             Write-Host "$file $size bytes"
           }
 
-      - name: Upload artifacts (macOS)
-        if: inputs.upload-artifacts && contains(inputs.platform, 'macos')
+      - name: Installer lifecycle test (MSI)
+        shell: pwsh
+        run: |
+          ./.github/scripts/installer-lifecycle.ps1 `
+            -InstallerType msi `
+            -BundleDir "${{ inputs.target != '' && inputs.target != 'x86_64-pc-windows-msvc' && format('src-tauri/target/{0}/{1}/bundle', inputs.target, steps.build-profile.outputs.profile) || format('src-tauri/target/{0}/bundle', steps.build-profile.outputs.profile) }}"
+
+      - name: Installer lifecycle test (NSIS)
+        shell: pwsh
+        run: |
+          ./.github/scripts/installer-lifecycle.ps1 `
+            -InstallerType nsis `
+            -BundleDir "${{ inputs.target != '' && inputs.target != 'x86_64-pc-windows-msvc' && format('src-tauri/target/{0}/{1}/bundle', inputs.target, steps.build-profile.outputs.profile) || format('src-tauri/target/{0}/bundle', steps.build-profile.outputs.profile) }}"
+
+      - name: Upload installer lifecycle diagnostics
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.asset-prefix }}-${{ inputs.target }}
-          path: |
-            src-tauri/target/${{ inputs.target }}/${{ steps.build-profile.outputs.profile }}/bundle/dmg/*.dmg
-            src-tauri/target/${{ inputs.target }}/${{ steps.build-profile.outputs.profile }}/bundle/macos/*.app
-          retention-days: 30
-
-      - name: Install FUSE for AppImage processing
-        if: contains(inputs.platform, 'ubuntu')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fuse libfuse2
-
-      - name: Remove libwayland-client.so from AppImage
-        if: contains(inputs.platform, 'ubuntu')
-        run: |
-          # Find the AppImage file
-          APPIMAGE_PATH=$(find src-tauri/target/${{ steps.build-profile.outputs.profile }}/bundle/appimage -name "*.AppImage" | head -1)
-
-          if [ -n "$APPIMAGE_PATH" ]; then
-            echo "Processing AppImage: $APPIMAGE_PATH"
-
-            # Make AppImage executable
-            chmod +x "$APPIMAGE_PATH"
-
-            # Extract AppImage
-            cd "$(dirname "$APPIMAGE_PATH")"
-            APPIMAGE_NAME=$(basename "$APPIMAGE_PATH")
-
-            # Extract using the AppImage itself
-            "./$APPIMAGE_NAME" --appimage-extract
-
-            # Remove libwayland-client.so files
-            echo "Removing libwayland-client.so files..."
-            find squashfs-root -name "libwayland-client.so*" -type f -delete
-
-            # List what was removed for verification
-            echo "Files remaining in lib directories:"
-            find squashfs-root -name "lib*" -type d | head -5 | while read dir; do
-              echo "Contents of $dir:"
-              ls "$dir" | grep -E "(wayland|fuse)" || echo "  No wayland/fuse libraries found"
-            done
-
-            # Detect architecture and get appropriate appimagetool
-            if [[ "$(uname -m)" == "aarch64" ]]; then
-              APPIMAGETOOL_ARCH="aarch64"
-            else
-              APPIMAGETOOL_ARCH="x86_64"
-            fi
-
-            wget -q "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${APPIMAGETOOL_ARCH}.AppImage"
-            chmod +x "appimagetool-${APPIMAGETOOL_ARCH}.AppImage"
-
-            # Repackage AppImage with no-appstream to avoid warnings
-            ARCH="${APPIMAGETOOL_ARCH}" "./appimagetool-${APPIMAGETOOL_ARCH}.AppImage" --no-appstream squashfs-root "$APPIMAGE_NAME"
-
-            # Clean up
-            rm -rf squashfs-root "appimagetool-${APPIMAGETOOL_ARCH}.AppImage"
-
-            echo "libwayland-client.so removed from AppImage successfully"
-          else
-            echo "No AppImage found to process"
-          fi
-
-      - name: Upload artifacts (Linux)
-        if: inputs.upload-artifacts && contains(inputs.platform, 'ubuntu')
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.asset-prefix }}-${{ inputs.platform }}-${{ inputs.target }}
-          path: |
-            src-tauri/target/${{ steps.build-profile.outputs.profile }}/bundle/deb/*.deb
-            src-tauri/target/${{ steps.build-profile.outputs.profile }}/bundle/appimage/*.AppImage
-            src-tauri/target/${{ steps.build-profile.outputs.profile }}/bundle/rpm/*.rpm
-          retention-days: 30
+          name: installer-lifecycle-logs-${{ inputs.target }}
+          path: ${{ runner.temp }}/installer-lifecycle/
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Upload artifacts (Windows)
-        if: inputs.upload-artifacts && contains(inputs.platform, 'windows')
+        if: inputs.upload-artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.asset-prefix }}-${{ inputs.target }}
