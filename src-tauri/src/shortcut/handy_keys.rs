@@ -21,17 +21,50 @@
 //! from a single thread. Commands (register/unregister) are sent via an mpsc
 //! channel and responses are synchronously awaited.
 //!
+//! ## OS-level key blocking and the Linux compromise
+//!
+//! Only push-to-talk transcribe triggers should be *blocked* system-wide (see
+//! [`should_block_os_key`]): holding e.g. `option+space` must not type spaces
+//! into the focused app. Every other binding must stay passive so it never
+//! swallows a keystroke destined for another application.
+//!
+//! On **Windows/macOS** this is implemented with two managers: a blocking
+//! manager (a consuming event tap) for the transcribe triggers and a passive,
+//! non-blocking manager for everything else.
+//!
+//! On **Linux** we deliberately run only a **single passive manager**. Each
+//! `HotkeyManager` spawns a `KeyboardListener` that, on Linux, performs an
+//! *exclusive* `rdev::grab()` evdev grab of the input devices. Two grabs are
+//! mutually exclusive: a second listener cannot obtain the grab and would spin
+//! retrying, leaving one of the two managers permanently deaf depending on
+//! thread scheduling. To keep every binding working we route all Linux bindings
+//! — including the transcribe triggers — through the passive manager. The
+//! trade-off is explicit: **on Linux the transcribe keys are NOT OS-blocked**
+//! and will still reach the focused application. The policy classification in
+//! [`should_block_os_key`] is preserved and still used on Windows/macOS.
+//!
+//! ## Collision handling
+//!
+//! A single canonical [`HotkeyRegistry`] maps each physical combo to the
+//! binding that owns it, shared across both manager categories. Registration
+//! rejects inter-manager collisions atomically (in either registration order)
+//! *before* touching an OS manager, so the same physical combo can never be
+//! claimed by two bindings even when they route to different managers.
+//!
 //! ## Recording Mode
 //!
 //! For UI key capture, a separate `KeyboardListener` is created on-demand and
 //! polled from a dedicated recording thread. Events are emitted to the frontend
-//! via Tauri's event system.
+//! via Tauri's event system. The whole capture session lives behind a single
+//! [`RecordingState`] with an atomic claim (no concurrent double-start) and an
+//! idempotent teardown that also auto-expires (see [`MAX_RECORDING_DURATION`]).
 
 use handy_keys::{Hotkey, HotkeyId, HotkeyManager, HotkeyState, KeyboardListener};
 use log::{debug, error, info};
 use serde::Serialize;
 use specta::Type;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -51,8 +84,153 @@ use super::handler::handle_shortcut_event;
 /// matched combo has to be consumed by a blocking event tap. Every other
 /// binding (pause, cancel/escape, history, copy-latest, post-processing action
 /// digits, …) is passive and must never swallow a keystroke for other apps.
+///
+/// This is the *policy* classification. It is honoured on Windows/macOS; on
+/// Linux only the passive manager exists (see module docs) so the physical
+/// routing in [`physical_category`] forces every binding passive there.
 fn should_block_os_key(binding_id: &str) -> bool {
     is_transcribe_binding(binding_id)
+}
+
+/// Which physical OS manager a binding is registered with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ManagerCategory {
+    /// Consuming event tap; the combo is blocked from other apps.
+    Blocking,
+    /// Non-blocking listener; the combo still reaches other apps.
+    Passive,
+}
+
+/// The physical manager a binding is routed to.
+///
+/// On Linux this is always [`ManagerCategory::Passive`]: two concurrent
+/// `rdev::grab()` listeners are mutually exclusive, so we run a single passive
+/// manager and the transcribe triggers are intentionally NOT OS-blocked. On
+/// Windows/macOS the policy classification from [`should_block_os_key`] decides.
+fn physical_category(binding_id: &str) -> ManagerCategory {
+    #[cfg(target_os = "linux")]
+    {
+        // The policy classification is preserved for reference, but Linux runs a
+        // single passive manager (two rdev grabs are mutually exclusive), so
+        // every binding — including transcribe triggers — is passive here and is
+        // therefore NOT OS-blocked (see module docs).
+        let _would_block_on_desktop = should_block_os_key(binding_id);
+        ManagerCategory::Passive
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if should_block_os_key(binding_id) {
+            ManagerCategory::Blocking
+        } else {
+            ManagerCategory::Passive
+        }
+    }
+}
+
+/// A committed registration entry, keyed by binding id.
+struct Registration<Id> {
+    hotkey: Hotkey,
+    id: Id,
+    category: ManagerCategory,
+}
+
+/// Canonical, single source of truth for every registered physical hotkey.
+///
+/// Shared across manager categories so a given physical combo can be owned by at
+/// most one binding regardless of which manager it routes to. Generic over the
+/// OS id type so the collision/cleanup logic can be unit-tested without a real
+/// [`HotkeyManager`] (whose [`HotkeyId`] cannot be constructed outside the
+/// crate).
+struct HotkeyRegistry<Id = HotkeyId> {
+    /// Physical combo -> owning binding id (global collision map).
+    by_hotkey: HashMap<Hotkey, String>,
+    /// Binding id -> registration details (for unregister/routing).
+    by_binding: HashMap<String, Registration<Id>>,
+    /// Per-category dispatch maps. `HotkeyId`s are allocated per-manager and
+    /// would otherwise collide between managers, so each category keeps its own.
+    blocking_ids: HashMap<Id, (String, String)>,
+    passive_ids: HashMap<Id, (String, String)>,
+}
+
+impl<Id: Copy + Eq + Hash> Default for HotkeyRegistry<Id> {
+    fn default() -> Self {
+        Self {
+            by_hotkey: HashMap::new(),
+            by_binding: HashMap::new(),
+            blocking_ids: HashMap::new(),
+            passive_ids: HashMap::new(),
+        }
+    }
+}
+
+impl<Id: Copy + Eq + Hash> HotkeyRegistry<Id> {
+    /// Read-only inter-manager collision check against the canonical map.
+    ///
+    /// Rejects a physical combo already owned by a *different* binding, in
+    /// either registration order (blocking↔passive). Re-checking the same
+    /// binding's own combo is not a collision.
+    fn check_collision(&self, hotkey: &Hotkey, binding_id: &str) -> Result<(), String> {
+        if let Some(existing) = self.by_hotkey.get(hotkey) {
+            if existing != binding_id {
+                return Err(format!(
+                    "Hotkey combination already bound to '{}'",
+                    existing
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit a successful OS registration into every map.
+    ///
+    /// Infallible and only ever called *after* the underlying manager accepted
+    /// the hotkey and after [`check_collision`](Self::check_collision) passed,
+    /// so a failed OS registration never pollutes the registry.
+    fn commit(
+        &mut self,
+        binding_id: &str,
+        hotkey: Hotkey,
+        hotkey_string: &str,
+        id: Id,
+        category: ManagerCategory,
+    ) {
+        self.by_hotkey.insert(hotkey, binding_id.to_string());
+        self.by_binding.insert(
+            binding_id.to_string(),
+            Registration {
+                hotkey,
+                id,
+                category,
+            },
+        );
+        let ids = match category {
+            ManagerCategory::Blocking => &mut self.blocking_ids,
+            ManagerCategory::Passive => &mut self.passive_ids,
+        };
+        ids.insert(id, (binding_id.to_string(), hotkey_string.to_string()));
+    }
+
+    /// Remove a binding from every map. Returns the `(id, category)` so the
+    /// caller can unregister it from the correct OS manager.
+    fn remove(&mut self, binding_id: &str) -> Option<(Id, ManagerCategory)> {
+        let reg = self.by_binding.remove(binding_id)?;
+        self.by_hotkey.remove(&reg.hotkey);
+        let ids = match reg.category {
+            ManagerCategory::Blocking => &mut self.blocking_ids,
+            ManagerCategory::Passive => &mut self.passive_ids,
+        };
+        ids.remove(&reg.id);
+        Some((reg.id, reg.category))
+    }
+
+    /// Resolve an incoming OS event `id` (within its manager category) back to
+    /// the owning `(binding_id, hotkey_string)`.
+    fn dispatch_target(&self, category: ManagerCategory, id: &Id) -> Option<&(String, String)> {
+        match category {
+            ManagerCategory::Blocking => self.blocking_ids.get(id),
+            ManagerCategory::Passive => self.passive_ids.get(id),
+        }
+    }
 }
 
 /// Commands that can be sent to the hotkey manager thread
@@ -77,26 +255,140 @@ enum ManagerCommand {
 /// a shortcut takes a second or two, so this is far longer than any real use.
 const MAX_RECORDING_DURATION: Duration = Duration::from_secs(30);
 
+/// A single in-flight key-recording session for the settings UI.
+struct RecordingSession {
+    /// OS key listener feeding the recording loop. `None` only in unit tests,
+    /// which exercise the session lifecycle without a real OS hook.
+    listener: Option<KeyboardListener>,
+    /// The binding currently being recorded. Cleared on teardown/expiry.
+    #[allow(dead_code)]
+    binding_id: String,
+    /// When recording started; drives auto-expiry.
+    started_at: Instant,
+    /// Per-session stop flag for the recording loop. Cleared on teardown so the
+    /// exact loop bound to *this* session exits and no stale listener survives.
+    running: Arc<AtomicBool>,
+}
+
+/// Single source of truth for the settings-UI key capture session.
+///
+/// `is_recording` is the atomic guard: `claim` flips it `false → true` with a
+/// `compare_exchange`, so two concurrent `start_recording` calls can never both
+/// win. `session` holds the listener, timing and per-session stop flag. Every
+/// teardown path clears all of it, idempotently.
+struct RecordingState {
+    is_recording: AtomicBool,
+    session: Mutex<Option<RecordingSession>>,
+}
+
+impl RecordingState {
+    fn new() -> Self {
+        Self {
+            is_recording: AtomicBool::new(false),
+            session: Mutex::new(None),
+        }
+    }
+
+    /// Atomically claim the recording slot.
+    ///
+    /// A stale (expired) session is torn down first so a crashed recording can't
+    /// block new ones. Returns `Err` if another session is already active. The
+    /// `compare_exchange` makes this safe against concurrent double-start.
+    fn claim(&self) -> Result<(), String> {
+        self.expire_if_stale(Instant::now());
+        self.is_recording
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| "Already recording".to_string())?;
+        Ok(())
+    }
+
+    /// Release a claim taken by [`claim`](Self::claim) when session setup fails
+    /// before a session is installed.
+    fn abort_claim(&self) {
+        self.is_recording.store(false, Ordering::SeqCst);
+    }
+
+    /// Install the live session and return its per-session stop flag for the
+    /// recording loop. Must be called after a successful [`claim`](Self::claim).
+    fn install_session(
+        &self,
+        binding_id: String,
+        listener: Option<KeyboardListener>,
+    ) -> Arc<AtomicBool> {
+        let running = Arc::new(AtomicBool::new(true));
+        let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(RecordingSession {
+            listener,
+            binding_id,
+            started_at: Instant::now(),
+            running: Arc::clone(&running),
+        });
+        running
+    }
+
+    /// Fully and idempotently tear down any session: stop the loop, drop the
+    /// listener, and clear the flag, binding id, and timestamp.
+    fn teardown(&self) {
+        self.is_recording.store(false, Ordering::SeqCst);
+        let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = guard.as_ref() {
+            session.running.store(false, Ordering::SeqCst);
+        }
+        *guard = None;
+    }
+
+    /// If a session has outlived [`MAX_RECORDING_DURATION`], tear it down.
+    /// Returns whether an expiry-driven teardown happened. `now` is injected so
+    /// expiry is testable without sleeping.
+    fn expire_if_stale(&self, now: Instant) -> bool {
+        if !self.is_recording.load(Ordering::SeqCst) {
+            return false;
+        }
+        let stale = {
+            let guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(session) => {
+                    now.saturating_duration_since(session.started_at) >= MAX_RECORDING_DURATION
+                }
+                // Claimed but session not yet installed: mid-setup, not stale.
+                None => false,
+            }
+        };
+        if stale {
+            self.teardown();
+        }
+        stale
+    }
+
+    /// Whether the UI is actively capturing keys for a new binding.
+    ///
+    /// Returns false (and fully tears the session down) once the session has
+    /// outlived [`MAX_RECORDING_DURATION`], so a frontend that never calls
+    /// `stop_recording` can't leave global shortcuts suppressed or a stale
+    /// listener alive.
+    fn is_capturing(&self) -> bool {
+        self.is_capturing_at(Instant::now())
+    }
+
+    fn is_capturing_at(&self, now: Instant) -> bool {
+        if !self.is_recording.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self.expire_if_stale(now) {
+            return false;
+        }
+        true
+    }
+}
+
 /// State for the handy-keys shortcut manager
 pub struct HandyKeysState {
     /// Channel to send commands to the manager thread (wrapped in Mutex for Sync)
     command_sender: Mutex<Sender<ManagerCommand>>,
     /// Handle to the manager thread (wrapped in Mutex for Sync, allows proper join on drop)
     thread_handle: Mutex<Option<JoinHandle<()>>>,
-    /// Recording listener for UI key capture (only active during recording)
-    recording_listener: Mutex<Option<KeyboardListener>>,
-    /// Whether the settings UI is currently capturing keys to record a new
-    /// binding. While set, the manager thread suppresses global shortcut
-    /// actions (see `is_capturing`) so recording a combo like "Left Ctrl + V"
-    /// doesn't also fire an existing shortcut bound to those keys.
-    is_recording: AtomicBool,
-    /// When the current recording started. Used by `is_capturing` as a safety
-    /// net so suppression auto-expires if the frontend never stops recording.
-    recording_started_at: Mutex<Option<Instant>>,
-    /// The binding ID being recorded (if any)
-    recording_binding_id: Mutex<Option<String>>,
-    /// Flag to stop recording loop
-    recording_running: Arc<AtomicBool>,
+    /// Settings-UI key capture session (see [`RecordingState`]).
+    recording: RecordingState,
 }
 
 /// Key event sent to frontend during recording mode
@@ -126,39 +418,16 @@ impl HandyKeysState {
         Ok(Self {
             command_sender: Mutex::new(cmd_tx),
             thread_handle: Mutex::new(Some(thread_handle)),
-            recording_listener: Mutex::new(None),
-            is_recording: AtomicBool::new(false),
-            recording_started_at: Mutex::new(None),
-            recording_binding_id: Mutex::new(None),
-            recording_running: Arc::new(AtomicBool::new(false)),
+            recording: RecordingState::new(),
         })
     }
 
-    /// The main manager thread - owns the HotkeyManager and processes commands
+    /// The main manager thread - owns the HotkeyManager(s) and processes commands
     fn manager_thread(cmd_rx: Receiver<ManagerCommand>, app: AppHandle) {
         info!("handy-keys manager thread started");
 
-        // Two managers are used so that OS-level key *blocking* is scoped to
-        // only the push-to-talk transcribe triggers. Those must be suppressed
-        // (e.g. holding `option+space` should not type spaces into the focused
-        // app), so they go through a blocking event tap that consumes the
-        // matched combo. EVERY other binding (cancel, pause, history, action
-        // digits, …) is handled by a passive, non-blocking listener that can
-        // never swallow a keystroke.
-        //
-        // This is the fix for the "Parler hijacks my whole keyboard" class of
-        // bug: previously *all* registered bindings were blocking, so a
-        // misbehaving or overly-broad shortcut would consume keys system-wide,
-        // breaking keystroke monitoring for other apps (Klack, the macOS
-        // shortcut recorder, etc.). Now at most the configured transcribe
-        // trigger combos can ever be blocked.
-        let blocking_manager = match HotkeyManager::new_with_blocking() {
-            Ok(m) => m,
-            Err(e) => {
-                error!("Failed to create blocking HotkeyManager: {}", e);
-                return;
-            }
-        };
+        // The passive, non-blocking manager exists on every platform and handles
+        // every binding that must NOT swallow keys for other apps.
         let passive_manager = match HotkeyManager::new() {
             Ok(m) => m,
             Err(e) => {
@@ -167,21 +436,38 @@ impl HandyKeysState {
             }
         };
 
-        // Separate maps per manager: HotkeyId values are allocated per-manager
-        // and would otherwise collide between the two.
-        let mut blocking_binding_to_hotkey: HashMap<String, HotkeyId> = HashMap::new();
-        let mut blocking_hotkey_to_binding: HashMap<HotkeyId, (String, String)> = HashMap::new();
-        let mut passive_binding_to_hotkey: HashMap<String, HotkeyId> = HashMap::new();
-        let mut passive_hotkey_to_binding: HashMap<HotkeyId, (String, String)> = HashMap::new();
+        // The blocking manager (a consuming event tap) exists only on
+        // Windows/macOS. On Linux a second listener would fight the passive
+        // manager for an exclusive `rdev::grab()` and lose, so we keep a single
+        // passive listener there and accept that transcribe keys are not
+        // OS-blocked on Linux (see module docs).
+        #[cfg(not(target_os = "linux"))]
+        let blocking_manager = match HotkeyManager::new_with_blocking() {
+            Ok(m) => Some(m),
+            Err(e) => {
+                error!("Failed to create blocking HotkeyManager: {}", e);
+                return;
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let blocking_manager: Option<HotkeyManager> = None;
+
+        let mut registry: HotkeyRegistry = HotkeyRegistry::default();
 
         loop {
-            // Drain hotkey events from both managers (non-blocking).
-            for (manager, map) in [
-                (&blocking_manager, &blocking_hotkey_to_binding),
-                (&passive_manager, &passive_hotkey_to_binding),
+            // Drain hotkey events from every active manager (non-blocking),
+            // dispatching each via that manager's own id map.
+            for (manager, category) in [
+                (blocking_manager.as_ref(), ManagerCategory::Blocking),
+                (Some(&passive_manager), ManagerCategory::Passive),
             ] {
+                let Some(manager) = manager else {
+                    continue;
+                };
                 while let Some(event) = manager.try_recv() {
-                    if let Some((binding_id, hotkey_string)) = map.get(&event.id) {
+                    if let Some((binding_id, hotkey_string)) =
+                        registry.dispatch_target(category, &event.id)
+                    {
                         // While the user is recording a new binding in the settings
                         // UI, suppress all global shortcut actions. Otherwise a
                         // registered shortcut (e.g. a modifier-only "Left Ctrl"
@@ -191,7 +477,7 @@ impl HandyKeysState {
                         // up and fire once recording ends.
                         if app
                             .try_state::<HandyKeysState>()
-                            .is_some_and(|state| state.is_capturing())
+                            .is_some_and(|state| state.recording.is_capturing())
                         {
                             continue;
                         }
@@ -213,45 +499,25 @@ impl HandyKeysState {
                         hotkey_string,
                         response,
                     } => {
-                        // Push-to-talk triggers block; everything else is passive.
-                        let result = if should_block_os_key(&binding_id) {
-                            Self::do_register(
-                                &blocking_manager,
-                                &mut blocking_binding_to_hotkey,
-                                &mut blocking_hotkey_to_binding,
-                                &binding_id,
-                                &hotkey_string,
-                            )
-                        } else {
-                            Self::do_register(
-                                &passive_manager,
-                                &mut passive_binding_to_hotkey,
-                                &mut passive_hotkey_to_binding,
-                                &binding_id,
-                                &hotkey_string,
-                            )
-                        };
+                        let result = Self::do_register(
+                            &mut registry,
+                            blocking_manager.as_ref(),
+                            &passive_manager,
+                            &binding_id,
+                            &hotkey_string,
+                        );
                         let _ = response.send(result);
                     }
                     ManagerCommand::Unregister {
                         binding_id,
                         response,
                     } => {
-                        let result = if should_block_os_key(&binding_id) {
-                            Self::do_unregister(
-                                &blocking_manager,
-                                &mut blocking_binding_to_hotkey,
-                                &mut blocking_hotkey_to_binding,
-                                &binding_id,
-                            )
-                        } else {
-                            Self::do_unregister(
-                                &passive_manager,
-                                &mut passive_binding_to_hotkey,
-                                &mut passive_hotkey_to_binding,
-                                &binding_id,
-                            )
-                        };
+                        let result = Self::do_unregister(
+                            &mut registry,
+                            blocking_manager.as_ref(),
+                            &passive_manager,
+                            &binding_id,
+                        );
                         let _ = response.send(result);
                     }
                     ManagerCommand::Shutdown => {
@@ -272,11 +538,15 @@ impl HandyKeysState {
         info!("handy-keys manager thread stopped");
     }
 
-    /// Register a hotkey
+    /// Register a hotkey.
+    ///
+    /// Rejects inter-manager physical collisions *before* touching an OS manager
+    /// and only records the registration once the OS manager accepts it, so a
+    /// failed OS registration never pollutes the canonical registry.
     fn do_register(
-        manager: &HotkeyManager,
-        binding_to_hotkey: &mut HashMap<String, HotkeyId>,
-        hotkey_to_binding: &mut HashMap<HotkeyId, (String, String)>,
+        registry: &mut HotkeyRegistry,
+        blocking_manager: Option<&HotkeyManager>,
+        passive_manager: &HotkeyManager,
         binding_id: &str,
         hotkey_string: &str,
     ) -> Result<(), String> {
@@ -284,32 +554,53 @@ impl HandyKeysState {
             .parse()
             .map_err(|e| format!("Failed to parse hotkey '{}': {}", hotkey_string, e))?;
 
+        // If this binding is already registered (e.g. re-register without an
+        // explicit unregister), tear the old entry down first so the canonical
+        // registry never leaks a stale combo or OS registration.
+        if registry.by_binding.contains_key(binding_id) {
+            Self::do_unregister(registry, blocking_manager, passive_manager, binding_id)?;
+        }
+
+        // Atomically reject a combo already owned by another binding, in either
+        // registration order, before any OS manager is touched.
+        registry.check_collision(&hotkey, binding_id)?;
+
+        let category = physical_category(binding_id);
+        let manager = match category {
+            ManagerCategory::Blocking => blocking_manager.unwrap_or(passive_manager),
+            ManagerCategory::Passive => passive_manager,
+        };
+
+        // On failure the registry is left untouched (commit runs only on success).
         let id = manager
             .register(hotkey)
             .map_err(|e| format!("Failed to register hotkey: {}", e))?;
 
-        binding_to_hotkey.insert(binding_id.to_string(), id);
-        hotkey_to_binding.insert(id, (binding_id.to_string(), hotkey_string.to_string()));
+        registry.commit(binding_id, hotkey, hotkey_string, id, category);
 
         debug!(
-            "Registered handy-keys shortcut: {} -> {:?}",
-            binding_id, hotkey
+            "Registered handy-keys shortcut: {} -> {:?} ({:?})",
+            binding_id, hotkey, category
         );
         Ok(())
     }
 
-    /// Unregister a hotkey
+    /// Unregister a hotkey, cleaning every registry map even if the OS
+    /// unregister errors.
     fn do_unregister(
-        manager: &HotkeyManager,
-        binding_to_hotkey: &mut HashMap<String, HotkeyId>,
-        hotkey_to_binding: &mut HashMap<HotkeyId, (String, String)>,
+        registry: &mut HotkeyRegistry,
+        blocking_manager: Option<&HotkeyManager>,
+        passive_manager: &HotkeyManager,
         binding_id: &str,
     ) -> Result<(), String> {
-        if let Some(id) = binding_to_hotkey.remove(binding_id) {
+        if let Some((id, category)) = registry.remove(binding_id) {
+            let manager = match category {
+                ManagerCategory::Blocking => blocking_manager.unwrap_or(passive_manager),
+                ManagerCategory::Passive => passive_manager,
+            };
             manager
                 .unregister(id)
                 .map_err(|e| format!("Failed to unregister hotkey: {}", e))?;
-            hotkey_to_binding.remove(&id);
             debug!("Unregistered handy-keys shortcut: {}", binding_id);
         }
         Ok(())
@@ -348,62 +639,30 @@ impl HandyKeysState {
             .map_err(|_| "Failed to receive unregister response")?
     }
 
-    /// Whether the UI is actively capturing keys for a new binding.
+    /// Start recording mode for a specific binding.
     ///
-    /// Returns false once `MAX_RECORDING_DURATION` has elapsed even if
-    /// `is_recording` is still set, so a frontend that never calls
-    /// `stop_recording` can't leave global shortcuts suppressed indefinitely.
-    fn is_capturing(&self) -> bool {
-        if !self.is_recording.load(Ordering::SeqCst) {
-            return false;
-        }
-        let started = self
-            .recording_started_at
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        started.is_some_and(|t| t.elapsed() < MAX_RECORDING_DURATION)
-    }
-
-    /// Start recording mode for a specific binding
+    /// The [`RecordingState::claim`] is atomic, so a concurrent second call is
+    /// rejected instead of replacing the live listener.
     pub fn start_recording(&self, app: &AppHandle, binding_id: String) -> Result<(), String> {
-        if self.is_recording.load(Ordering::SeqCst) {
-            return Err("Already recording".into());
-        }
+        // Atomic claim: rejects a concurrent double-start and expires a stale one.
+        self.recording.claim()?;
 
-        // Create a new keyboard listener for recording
-        let listener = KeyboardListener::new()
-            .map_err(|e| format!("Failed to create keyboard listener: {}", e))?;
+        // Create a new keyboard listener for recording. If this fails we must
+        // release the claim so recording isn't wedged "on" forever.
+        let listener = match KeyboardListener::new() {
+            Ok(l) => l,
+            Err(e) => {
+                self.recording.abort_claim();
+                return Err(format!("Failed to create keyboard listener: {}", e));
+            }
+        };
 
-        {
-            let mut recording = self
-                .recording_listener
-                .lock()
-                .map_err(|_| "Failed to lock recording_listener")?;
-            *recording = Some(listener);
-        }
-        {
-            let mut binding = self
-                .recording_binding_id
-                .lock()
-                .map_err(|_| "Failed to lock recording_binding_id")?;
-            *binding = Some(binding_id);
-        }
-        {
-            let mut started = self
-                .recording_started_at
-                .lock()
-                .map_err(|_| "Failed to lock recording_started_at")?;
-            *started = Some(Instant::now());
-        }
-
-        self.is_recording.store(true, Ordering::SeqCst);
-        self.recording_running.store(true, Ordering::SeqCst);
+        let running = self.recording.install_session(binding_id, Some(listener));
 
         // Start a thread to emit key events to the frontend
         let app_clone = app.clone();
-        let recording_running = Arc::clone(&self.recording_running);
         thread::spawn(move || {
-            Self::recording_loop(app_clone, recording_running);
+            Self::recording_loop(app_clone, running);
         });
 
         debug!("Started handy-keys recording mode");
@@ -418,8 +677,8 @@ impl HandyKeysState {
                     Some(s) => s,
                     None => break,
                 };
-                let listener = state.recording_listener.lock().ok();
-                listener.as_ref().and_then(|l| l.as_ref()?.try_recv())
+                let guard = state.recording.session.lock().ok();
+                guard.and_then(|g| g.as_ref()?.listener.as_ref()?.try_recv())
             };
 
             if let Some(key_event) = event {
@@ -446,33 +705,9 @@ impl HandyKeysState {
         debug!("Recording loop ended");
     }
 
-    /// Stop recording mode
+    /// Stop recording mode (idempotent full teardown).
     pub fn stop_recording(&self) -> Result<(), String> {
-        self.is_recording.store(false, Ordering::SeqCst);
-        self.recording_running.store(false, Ordering::SeqCst);
-
-        {
-            let mut recording = self
-                .recording_listener
-                .lock()
-                .map_err(|_| "Failed to lock recording_listener")?;
-            *recording = None;
-        }
-        {
-            let mut binding = self
-                .recording_binding_id
-                .lock()
-                .map_err(|_| "Failed to lock recording_binding_id")?;
-            *binding = None;
-        }
-        {
-            let mut started = self
-                .recording_started_at
-                .lock()
-                .map_err(|_| "Failed to lock recording_started_at")?;
-            *started = None;
-        }
-
+        self.recording.teardown();
         debug!("Stopped handy-keys recording mode");
         Ok(())
     }
@@ -480,9 +715,9 @@ impl HandyKeysState {
 
 impl Drop for HandyKeysState {
     fn drop(&mut self) {
-        // Signal recording to stop
-        self.recording_running.store(false, Ordering::SeqCst);
-        self.is_recording.store(false, Ordering::SeqCst);
+        // Fully tear down any in-flight recording session (stops the loop and
+        // drops the listener).
+        self.recording.teardown();
 
         // Send shutdown command
         if let Ok(sender) = self.command_sender.lock() {
@@ -720,6 +955,10 @@ pub fn stop_handy_keys_recording(app: AppHandle) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn hotkey(s: &str) -> Hotkey {
+        s.parse().expect("valid hotkey")
+    }
+
     #[test]
     fn should_only_block_transcription_bindings() {
         // Push-to-talk transcribe triggers must be suppressed at the OS level so
@@ -737,5 +976,163 @@ mod tests {
         assert!(!should_block_os_key("action_1"));
         assert!(!should_block_os_key("action_9"));
         assert!(!should_block_os_key("ppa-example"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Canonical global physical hotkey registry (inter-manager collisions).
+    // Uses a `u32` id because `HotkeyId` cannot be constructed outside the
+    // handy-keys crate; the collision/cleanup logic is id-type agnostic.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn rejects_inter_manager_collision_blocking_then_passive() {
+        let mut registry = HotkeyRegistry::<u32>::default();
+        let combo = hotkey("ctrl+space");
+
+        registry.check_collision(&combo, "transcribe").unwrap();
+        registry.commit(
+            "transcribe",
+            combo,
+            "ctrl+space",
+            1,
+            ManagerCategory::Blocking,
+        );
+
+        // A passive binding claiming the same physical combo is rejected.
+        assert!(registry.check_collision(&combo, "pause").is_err());
+    }
+
+    #[test]
+    fn rejects_inter_manager_collision_passive_then_blocking() {
+        let mut registry = HotkeyRegistry::<u32>::default();
+        let combo = hotkey("ctrl+space");
+
+        registry.commit("pause", combo, "ctrl+space", 1, ManagerCategory::Passive);
+
+        // A blocking binding claiming the same physical combo is rejected.
+        assert!(registry.check_collision(&combo, "transcribe").is_err());
+    }
+
+    #[test]
+    fn same_binding_may_recheck_its_own_hotkey() {
+        let mut registry = HotkeyRegistry::<u32>::default();
+        let combo = hotkey("ctrl+space");
+
+        registry.commit(
+            "transcribe",
+            combo,
+            "ctrl+space",
+            1,
+            ManagerCategory::Blocking,
+        );
+
+        // Re-checking the same binding/combo is not a collision.
+        assert!(registry.check_collision(&combo, "transcribe").is_ok());
+    }
+
+    #[test]
+    fn unregister_then_reregister_cleans_registry() {
+        let mut registry = HotkeyRegistry::<u32>::default();
+        let combo = hotkey("ctrl+space");
+
+        registry.commit(
+            "transcribe",
+            combo,
+            "ctrl+space",
+            1,
+            ManagerCategory::Blocking,
+        );
+        let removed = registry.remove("transcribe");
+        assert_eq!(removed, Some((1, ManagerCategory::Blocking)));
+
+        // The combo is free again and can be claimed by a different binding, even
+        // in the other manager category.
+        assert!(registry.check_collision(&combo, "pause").is_ok());
+        registry.commit("pause", combo, "ctrl+space", 7, ManagerCategory::Passive);
+        assert_eq!(
+            registry
+                .dispatch_target(ManagerCategory::Passive, &7)
+                .map(|(b, _)| b.as_str()),
+            Some("pause")
+        );
+        // The old blocking id no longer dispatches to anything.
+        assert!(registry
+            .dispatch_target(ManagerCategory::Blocking, &1)
+            .is_none());
+    }
+
+    #[test]
+    fn failed_registration_does_not_pollute_registry() {
+        let mut registry = HotkeyRegistry::<u32>::default();
+        let combo = hotkey("ctrl+space");
+
+        // Collision check passes, then the OS manager (would) reject the hotkey,
+        // so `commit` is never called.
+        registry.check_collision(&combo, "transcribe").unwrap();
+
+        // The registry is untouched: nothing tracked and the combo is still free.
+        assert!(registry.by_hotkey.is_empty());
+        assert!(registry.by_binding.is_empty());
+        assert!(registry.check_collision(&combo, "pause").is_ok());
+    }
+
+    // ---------------------------------------------------------------------
+    // Recording session lifecycle (no real OS hooks: `listener: None`).
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn rejects_concurrent_double_start() {
+        let state = RecordingState::new();
+        state.claim().expect("first claim succeeds");
+        // A concurrent second claim must be rejected, not replace the session.
+        assert!(state.claim().is_err());
+    }
+
+    #[test]
+    fn expiry_fully_and_idempotently_cleans_session() {
+        let state = RecordingState::new();
+        state.claim().unwrap();
+        state.install_session("transcribe".into(), None);
+
+        // A fresh session is still capturing.
+        assert!(state.is_capturing_at(Instant::now()));
+
+        // Past the max duration, capture expires AND everything is cleared, so
+        // no stale listener/flag survives while global actions resume.
+        let future = Instant::now() + MAX_RECORDING_DURATION + Duration::from_secs(1);
+        assert!(!state.is_capturing_at(future));
+        assert!(!state.is_recording.load(Ordering::SeqCst));
+        assert!(state.session.lock().unwrap().is_none());
+
+        // A new session can be claimed again after expiry.
+        assert!(state.claim().is_ok());
+    }
+
+    #[test]
+    fn teardown_clears_all_state() {
+        let state = RecordingState::new();
+        state.claim().unwrap();
+        let running = state.install_session("pause".into(), None);
+
+        state.teardown();
+
+        assert!(!state.is_recording.load(Ordering::SeqCst));
+        assert!(!running.load(Ordering::SeqCst), "loop stop flag cleared");
+        assert!(state.session.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn teardown_is_idempotent() {
+        let state = RecordingState::new();
+        state.claim().unwrap();
+        state.install_session("pause".into(), None);
+
+        state.teardown();
+        // A second teardown must not panic and must leave clean state.
+        state.teardown();
+
+        assert!(!state.is_recording.load(Ordering::SeqCst));
+        assert!(state.session.lock().unwrap().is_none());
+        assert!(!state.is_capturing());
     }
 }
