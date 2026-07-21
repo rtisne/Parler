@@ -1063,7 +1063,7 @@ mod tests {
 
     #[test]
     fn failed_registration_does_not_pollute_registry() {
-        let mut registry = HotkeyRegistry::<u32>::default();
+        let registry = HotkeyRegistry::<u32>::default();
         let combo = hotkey("ctrl+space");
 
         // Collision check passes, then the OS manager (would) reject the hotkey,
