@@ -343,12 +343,13 @@ jobs:
           SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           SIGNING_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
-      - name: Disable updater artifacts signing (no key available)
-        if: steps.signing-check.outputs.has-signing-key != 'true'
+      - name: Disable updater artifacts signing (unsigned build)
+        if: ${{ !inputs.sign-binaries || steps.signing-check.outputs.has-signing-key != 'true' }}
         shell: bash
         run: |
-          echo "⚠️ Disabling createUpdaterArtifacts and removing pubkey (no signing key available)"
-          node -e 'var fs=require("fs"),c=JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json","utf8"));if(!c.bundle)c.bundle={};c.bundle.createUpdaterArtifacts=false;if(c.plugins&&c.plugins.updater)delete c.plugins.updater.pubkey;fs.writeFileSync("src-tauri/tauri.conf.json",JSON.stringify(c,null,2)+"\n");console.log("createUpdaterArtifacts disabled, pubkey removed");'
+          echo "⚠️ Disabling updater artifacts and removing updater plugin configuration (no signing key available)"
+          echo "PARLER_UPDATER_ENABLED=false" >> "$GITHUB_ENV"
+          node -e 'var fs=require("fs"),c=JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json","utf8"));if(!c.bundle)c.bundle={};c.bundle.createUpdaterArtifacts=false;if(c.plugins)delete c.plugins.updater;fs.writeFileSync("src-tauri/tauri.conf.json",JSON.stringify(c,null,2)+"\n");console.log("createUpdaterArtifacts disabled, updater plugin configuration removed");'
 
       - name: Build with Tauri
         if: inputs.apple_signing
@@ -392,6 +393,13 @@ jobs:
           releaseId: ${{ inputs.release-id }}
           assetNamePattern: ${{ steps.patch-release-name.outputs.platform }}
           args: ${{ inputs.build-args }}
+
+      - name: Smoke test Windows application startup
+        if: contains(inputs.platform, 'windows')
+        shell: pwsh
+        run: |
+          ./.github/scripts/smoke-test-windows-startup.ps1 `
+            -BinaryPath "${{ contains(inputs.build-args, '--target') && format('src-tauri/target/{0}/{1}/parler.exe', inputs.target, steps.build-profile.outputs.profile) || format('src-tauri/target/{0}/parler.exe', steps.build-profile.outputs.profile) }}"
 
       - name: Verify staged OpenBLAS runtime (Windows)
         if: contains(inputs.platform, 'windows')

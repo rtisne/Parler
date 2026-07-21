@@ -341,6 +341,26 @@ fn trigger_update_check(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn updater_enabled_from_build_flag(flag: Option<&str>) -> bool {
+    !matches!(flag, Some("false"))
+}
+
+#[cfg(test)]
+mod updater_build_flag_tests {
+    use super::updater_enabled_from_build_flag;
+
+    #[test]
+    fn updater_is_enabled_by_default() {
+        assert!(updater_enabled_from_build_flag(None));
+        assert!(updater_enabled_from_build_flag(Some("true")));
+    }
+
+    #[test]
+    fn updater_is_disabled_for_unsigned_builds() {
+        assert!(!updater_enabled_from_build_flag(Some("false")));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(cli_args: CliArgs) {
     // Parse console logging directives from RUST_LOG, falling back to info-level logging
@@ -517,8 +537,12 @@ pub fn run(cli_args: CliArgs) {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_process::init());
 
-    // Initialize the updater plugin
-    builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    // Unsigned release builds remove plugins.updater from the generated config.
+    // Do not register the plugin in that case: Tauri passes a missing plugin
+    // configuration as null, which tauri-plugin-updater rejects at startup.
+    if updater_enabled_from_build_flag(option_env!("PARLER_UPDATER_ENABLED")) {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
 
     builder
         .plugin(tauri_plugin_os::init())
