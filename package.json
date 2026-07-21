@@ -18,6 +18,7 @@
     "format:backend": "cd src-tauri && cargo fmt",
     "test:playwright": "playwright test",
     "test:playwright:ui": "playwright test --ui",
+    "test:translations": "bun test scripts/check-translations.test.ts",
     "check:translations": "bun scripts/check-translations.ts"
   },
   "dependencies": {

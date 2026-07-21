@@ -1,32 +1,21 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import {
+  type TranslationBaseline,
+  formatKeyPath,
+  validateBaselineLocales,
+  validateTranslationKeys,
+} from "./check-translations-lib";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// Configuration
 const LOCALES_DIR = path.join(__dirname, "..", "src", "i18n", "locales");
+const BASELINE_FILE = path.join(__dirname, "translation-baseline.json");
 const REFERENCE_LANG = "en";
+const MAX_REPORTED_KEYS = 10;
 
 type TranslationData = Record<string, unknown>;
 
-interface ValidationResult {
-  valid: boolean;
-  missing: string[][];
-  extra: string[][];
-}
-
-function getLanguages(): string[] {
-  const entries = fs.readdirSync(LOCALES_DIR, { withFileTypes: true });
-  return entries
-    .filter((entry) => entry.isDirectory() && entry.name !== REFERENCE_LANG)
-    .map((entry) => entry.name)
-    .sort();
-}
-
-const LANGUAGES = getLanguages();
-
-// Colors for terminal output
 const colors: Record<string, string> = {
   reset: "\x1b[0m",
   red: "\x1b[31m",
@@ -39,186 +28,161 @@ function colorize(text: string, color: string): string {
   return `${colors[color]}${text}${colors.reset}`;
 }
 
-function getAllKeyPaths(
-  obj: TranslationData,
-  prefix: string[] = [],
-): string[][] {
-  let paths: string[][] = [];
-  for (const key in obj) {
-    if (!Object.hasOwn(obj, key)) continue;
+function getLanguages(): string[] {
+  return fs
+    .readdirSync(LOCALES_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name !== REFERENCE_LANG)
+    .map((entry) => entry.name)
+    .sort();
+}
 
-    const currentPath = prefix.concat([key]);
+function getAllKeyPaths(obj: TranslationData, prefix: string[] = []): string[] {
+  const paths: string[] = [];
+
+  for (const key in obj) {
+    if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+
+    const currentPath = [...prefix, key];
     const value = obj[key];
 
     if (typeof value === "object" && value !== null && !Array.isArray(value)) {
-      paths = paths.concat(
-        getAllKeyPaths(value as TranslationData, currentPath),
-      );
+      paths.push(...getAllKeyPaths(value as TranslationData, currentPath));
     } else {
-      paths.push(currentPath);
+      paths.push(formatKeyPath(currentPath));
     }
   }
-  return paths;
+
+  return paths.sort();
 }
 
-function hasKeyPath(obj: TranslationData, keyPath: string[]): boolean {
-  let current: unknown = obj;
-  for (const key of keyPath) {
-    if (
-      typeof current !== "object" ||
-      current === null ||
-      (current as Record<string, unknown>)[key] === undefined
-    ) {
-      return false;
-    }
-    current = (current as Record<string, unknown>)[key];
-  }
-  return true;
-}
-
-function loadTranslationFile(lang: string): TranslationData | null {
-  const filePath = path.join(LOCALES_DIR, lang, "translation.json");
-
+function loadJsonFile<T>(filePath: string, label: string): T | null {
   try {
-    const content = fs.readFileSync(filePath, "utf8");
-    return JSON.parse(content) as TranslationData;
+    return JSON.parse(fs.readFileSync(filePath, "utf8")) as T;
   } catch (error) {
-    console.error(colorize(`✗ Error loading ${lang}/translation.json:`, "red"));
+    console.error(colorize(`✗ Error loading ${label}:`, "red"));
     console.error(`  ${(error as Error).message}`);
     return null;
   }
 }
 
-function validateTranslations(): void {
-  console.log(colorize("\n🌍 Translation Consistency Check\n", "blue"));
+function loadTranslation(lang: string): TranslationData | null {
+  return loadJsonFile<TranslationData>(
+    path.join(LOCALES_DIR, lang, "translation.json"),
+    `${lang}/translation.json`,
+  );
+}
 
-  // Load reference file
-  console.log(`Loading reference language: ${REFERENCE_LANG}`);
-  const referenceData = loadTranslationFile(REFERENCE_LANG);
+function reportKeys(label: string, keys: string[]): void {
+  if (keys.length === 0) return;
 
-  if (!referenceData) {
-    console.error(
-      colorize(`\n✗ Failed to load reference file (${REFERENCE_LANG})`, "red"),
+  console.log(colorize(`  ${label} (${keys.length}):`, "yellow"));
+  keys.slice(0, MAX_REPORTED_KEYS).forEach((key) => {
+    console.log(`    - ${key}`);
+  });
+  if (keys.length > MAX_REPORTED_KEYS) {
+    console.log(
+      colorize(`    ... and ${keys.length - MAX_REPORTED_KEYS} more`, "yellow"),
     );
+  }
+}
+
+function validateTranslations(): void {
+  console.log(colorize("\n🌍 Translation Baseline Check\n", "blue"));
+
+  const languages = getLanguages();
+  const referenceData = loadTranslation(REFERENCE_LANG);
+  const baseline = loadJsonFile<TranslationBaseline>(
+    BASELINE_FILE,
+    "translation-baseline.json",
+  );
+
+  if (!referenceData || !baseline) {
     process.exit(1);
   }
 
-  // Get all key paths from reference
-  const referenceKeyPaths = getAllKeyPaths(referenceData);
-  console.log(`Reference has ${referenceKeyPaths.length} keys\n`);
+  const baselineLocales = validateBaselineLocales(languages, baseline);
+  if (
+    baselineLocales.missing.length > 0 ||
+    baselineLocales.duplicated.length > 0 ||
+    baselineLocales.unknown.length > 0
+  ) {
+    console.error(colorize("✗ Invalid baseline locale coverage", "red"));
+    reportKeys("Missing locales", baselineLocales.missing);
+    reportKeys("Duplicated locales", baselineLocales.duplicated);
+    reportKeys("Unknown locales", baselineLocales.unknown);
+    process.exit(1);
+  }
 
-  // Track validation results
+  const referenceKeys = getAllKeyPaths(referenceData);
   let hasErrors = false;
-  const results: Record<string, ValidationResult> = {};
+  let documentedDebt = 0;
 
-  // Validate each language
-  for (const lang of LANGUAGES) {
-    const langData = loadTranslationFile(lang);
+  console.log(`Reference has ${referenceKeys.length} keys`);
+  console.log("─".repeat(60));
 
+  for (const lang of languages) {
+    const langData = loadTranslation(lang);
     if (!langData) {
       hasErrors = true;
-      results[lang] = { valid: false, missing: [], extra: [] };
       continue;
     }
 
-    // Find missing keys
-    const missing = referenceKeyPaths.filter(
-      (keyPath) => !hasKeyPath(langData, keyPath),
+    const result = validateTranslationKeys(
+      referenceKeys,
+      getAllKeyPaths(langData),
+      lang,
+      baseline,
     );
+    const expectedMissing =
+      baseline.common.length +
+      baseline.groups
+        .filter((group) => group.locales.includes(lang))
+        .reduce((count, group) => count + group.additional.length, 0);
+    documentedDebt += expectedMissing;
 
-    // Find extra keys (keys in language but not in reference)
-    const langKeyPaths = getAllKeyPaths(langData);
-    const extra = langKeyPaths.filter(
-      (keyPath) => !hasKeyPath(referenceData, keyPath),
-    );
+    const valid =
+      result.unexpectedMissing.length === 0 &&
+      result.resolvedBaseline.length === 0 &&
+      result.extra.length === 0;
 
-    results[lang] = {
-      valid: missing.length === 0 && extra.length === 0,
-      missing,
-      extra,
-    };
-
-    if (missing.length > 0 || extra.length > 0) {
-      hasErrors = true;
-    }
-  }
-
-  // Print results
-  console.log(colorize("Results:", "blue"));
-  console.log("─".repeat(60));
-
-  for (const lang of LANGUAGES) {
-    const result = results[lang];
-
-    if (result.valid) {
+    if (valid) {
       console.log(
-        colorize(`✓ ${lang.toUpperCase()}: All keys present`, "green"),
+        colorize(
+          `✓ ${lang.toUpperCase()}: matches baseline (${expectedMissing} documented missing keys)`,
+          "green",
+        ),
       );
-    } else {
-      console.log(colorize(`✗ ${lang.toUpperCase()}: Issues found`, "red"));
-
-      if (result.missing.length > 0) {
-        console.log(
-          colorize(`  Missing ${result.missing.length} keys:`, "yellow"),
-        );
-        result.missing.slice(0, 10).forEach((keyPath) => {
-          console.log(`    - ${keyPath.join(".")}`);
-        });
-        if (result.missing.length > 10) {
-          console.log(
-            colorize(
-              `    ... and ${result.missing.length - 10} more`,
-              "yellow",
-            ),
-          );
-        }
-      }
-
-      if (result.extra.length > 0) {
-        console.log(
-          colorize(
-            `  Extra ${result.extra.length} keys (not in reference):`,
-            "yellow",
-          ),
-        );
-        result.extra.slice(0, 10).forEach((keyPath) => {
-          console.log(`    - ${keyPath.join(".")}`);
-        });
-        if (result.extra.length > 10) {
-          console.log(
-            colorize(`    ... and ${result.extra.length - 10} more`, "yellow"),
-          );
-        }
-      }
-
-      console.log("");
+      continue;
     }
+
+    hasErrors = true;
+    console.log(colorize(`✗ ${lang.toUpperCase()}: baseline drift`, "red"));
+    reportKeys("New missing keys", result.unexpectedMissing);
+    reportKeys(
+      "Translated keys to remove from baseline",
+      result.resolvedBaseline,
+    );
+    reportKeys("Extra keys absent from English", result.extra);
   }
 
   console.log("─".repeat(60));
-
-  // Summary
-  const validCount = Object.values(results).filter((r) => r.valid).length;
-  const totalCount = LANGUAGES.length;
 
   if (hasErrors) {
-    console.log(
+    console.error(
       colorize(
-        `\n✗ Validation failed: ${validCount}/${totalCount} languages passed`,
+        "\n✗ Translation baseline drift detected. Update translations and the baseline together.",
         "red",
       ),
     );
     process.exit(1);
-  } else {
-    console.log(
-      colorize(
-        `\n✓ All ${totalCount} languages have complete translations!`,
-        "green",
-      ),
-    );
-    process.exit(0);
   }
+
+  console.log(
+    colorize(
+      `\n✓ All ${languages.length} locales match the documented baseline (${documentedDebt} missing translations).`,
+      "green",
+    ),
+  );
 }
 
-// Run validation
 validateTranslations();
