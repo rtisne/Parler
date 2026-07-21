@@ -85,13 +85,12 @@ jobs:
         if: ${{ !(contains(inputs.platform, 'windows') && contains(inputs.target, 'aarch64')) }}
         uses: oven-sh/setup-bun@v2
 
-      # Bun does not fully support Windows ARM64 yet, so we pin the baseline build.
-      # See https://github.com/oven-sh/bun/issues/9824 for details.
-      - name: Setup Bun (Windows ARM64 baseline)
+      # Native Windows ARM64 builds are available since Bun 1.3.10.
+      - name: Setup Bun (Windows ARM64)
         if: ${{ contains(inputs.platform, 'windows') && contains(inputs.target, 'aarch64') }}
         uses: oven-sh/setup-bun@v2
         with:
-          bun-download-url: "https://github.com/oven-sh/bun/releases/latest/download/bun-windows-x64-baseline.zip"
+          bun-download-url: "https://github.com/oven-sh/bun/releases/latest/download/bun-windows-aarch64.zip"
 
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -104,6 +103,16 @@ jobs:
         with:
           workspaces: "./src-tauri -> target"
           key: ${{ inputs.platform }}-${{ inputs.target }}
+
+      - name: Setup OpenBLAS (Windows)
+        if: contains(inputs.platform, 'windows')
+        shell: pwsh
+        run: ./.github/scripts/setup-openblas.ps1 -Target "${{ inputs.target }}"
+
+      - name: Install pkg-config (Windows)
+        if: contains(inputs.platform, 'windows')
+        shell: pwsh
+        run: ./.github/scripts/setup-pkgconf.ps1 -Target "${{ inputs.target }}"
 
       - name: install dependencies (ubuntu 24.04 x64)
         if: contains(inputs.platform, 'ubuntu-24.04') && !contains(inputs.platform, 'arm')
@@ -383,6 +392,25 @@ jobs:
           releaseId: ${{ inputs.release-id }}
           assetNamePattern: ${{ steps.patch-release-name.outputs.platform }}
           args: ${{ inputs.build-args }}
+
+      - name: Verify staged OpenBLAS runtime (Windows)
+        if: contains(inputs.platform, 'windows')
+        shell: pwsh
+        run: |
+          $required = @("src-tauri/openblas-libs/libopenblas.dll")
+          if ("${{ inputs.target }}" -eq "aarch64-pc-windows-msvc") {
+            $required += "src-tauri/openblas-libs/openblas.dll"
+          }
+          foreach ($file in $required) {
+            if (-not (Test-Path $file -PathType Leaf)) {
+              throw "Required staged OpenBLAS runtime is missing: $file"
+            }
+            $size = (Get-Item $file).Length
+            if ($size -eq 0) {
+              throw "Staged OpenBLAS runtime is empty: $file"
+            }
+            Write-Host "$file $size bytes"
+          }
 
       - name: Upload artifacts (macOS)
         if: inputs.upload-artifacts && contains(inputs.platform, 'macos')

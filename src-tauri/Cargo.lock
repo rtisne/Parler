@@ -4294,6 +4294,7 @@ dependencies = [
  "tokio",
  "transcribe-rs",
  "vad-rs",
+ "whisper-rs",
  "windows 0.61.3",
 ]
 

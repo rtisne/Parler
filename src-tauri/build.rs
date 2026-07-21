@@ -1,8 +1,38 @@
+#[path = "build_support/openblas.rs"]
+mod openblas;
+
 fn main() {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     build_apple_intelligence_bridge();
 
     generate_tray_translations();
+
+    println!("cargo:rerun-if-env-changed=OPENBLAS_PATH");
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let manifest_dir = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is not set"),
+    );
+    let openblas_path = std::env::var_os("OPENBLAS_PATH").map(std::path::PathBuf::from);
+    let staged = openblas::stage_openblas_runtime(
+        &target_os,
+        &target_arch,
+        &manifest_dir,
+        openblas_path.as_deref(),
+    )
+    .unwrap_or_else(|error| panic!("failed to stage OpenBLAS for Windows: {error}"));
+    if !staged.is_empty() {
+        let openblas_path = openblas_path.expect("Windows OpenBLAS path was validated");
+        println!(
+            "cargo:rustc-link-search=native={}",
+            openblas_path.join("lib").display()
+        );
+        println!("cargo:rustc-link-lib=dylib=libopenblas");
+        println!(
+            "cargo:warning=Staged OpenBLAS runtime DLLs for Windows: {}",
+            staged.join(", ")
+        );
+    }
 
     tauri_build::build()
 }

@@ -27,6 +27,9 @@ dist-ssr
 *.sw?
 
 /target/
+src-tauri/openblas/
+src-tauri/openblas-libs/
+src-tauri/pkgconf/
 recording_*
 .crush/
 
