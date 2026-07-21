@@ -147,6 +147,22 @@ Describe "Get-UninstallCommand" {
         }
     }
 
+    It "normalizes a quoted NSIS InstallLocation" {
+        $installDir = New-TempDir
+        try {
+            $uninstaller = Join-Path $installDir "uninstall.exe"
+            New-Item -ItemType File -Path $uninstaller | Out-Null
+            $entry = [PSCustomObject]@{
+                QuietUninstallString = "`"$uninstaller`" /S"
+                InstallLocation = "`"$installDir`""
+            }
+            $cmd = Get-UninstallCommand -Entry $entry -InstallerType nsis -LogDir ([System.IO.Path]::GetTempPath())
+            $cmd.InstallRoot | Should -Be (Resolve-Path $installDir).Path
+        } finally {
+            Remove-Item -Recurse -Force $installDir -ErrorAction SilentlyContinue
+        }
+    }
+
     It "parses a trusted QuietUninstallString for NSIS" {
         $installDir = New-TempDir
         try {

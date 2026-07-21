@@ -71,7 +71,8 @@ NSIS it performs:
    entries must be Windows Installer entries with a valid ProductCode GUID. The
    selected entry must be newly created and carries its exact registry `PSPath`.
    An NSIS uninstaller must exist as `uninstall.exe` below the validated
-   `InstallLocation`; when Tauri omits that value, the existing uninstaller's
+   `InstallLocation`; quoted values and environment variables are normalized
+   before validation. When Tauri omits that value, the existing uninstaller's
    parent becomes the inferred trusted root. Arbitrary registry-provided
    executables and `DisplayIcon` paths outside that root are rejected.
 4. **Bounded launch survival** — launch `parler.exe --no-tray`, keep it alive

@@ -299,7 +299,7 @@ function Resolve-InstalledExecutable {
     )
 
     $installLocation = [string]$Entry.InstallLocation
-    $rootCandidate = if ($installLocation) { $installLocation } else { $TrustedInstallRoot }
+    $rootCandidate = if ($TrustedInstallRoot) { $TrustedInstallRoot } else { $installLocation }
     $resolvedInstallLocation = ""
     if ($rootCandidate) {
         if (-not (Test-Path $rootCandidate -PathType Container)) {
@@ -390,7 +390,8 @@ function Get-UninstallCommand {
         throw "NSIS uninstall executable must be named uninstall.exe."
     }
 
-    $installLocation = [string]$Entry.InstallLocation
+    $rawInstallLocation = [string]$Entry.InstallLocation
+    $installLocation = [Environment]::ExpandEnvironmentVariables($rawInstallLocation.Trim().Trim('"'))
     if ([string]::IsNullOrWhiteSpace($installLocation)) {
         $installRoot = (Resolve-Path (Split-Path -Parent $uninstaller)).Path
     } else {
@@ -646,7 +647,7 @@ function Invoke-InstallerLifecycle {
         $entry = Select-UninstallEntry -Entries @(Get-UninstallEntries) -ProductName $ProductName -InstallerType $InstallerType -ExcludedIdentities $beforeIdentities
         $entryIdentity = Get-UninstallEntryIdentity -Entry $entry
         $command = Get-UninstallCommand -Entry $entry -InstallerType $InstallerType -LogDir $logDir
-        $installDir = if ($entry.InstallLocation) { [string]$entry.InstallLocation } else { [string]$command.InstallRoot }
+        $installDir = if ($command.InstallRoot) { [string]$command.InstallRoot } else { [string]$entry.InstallLocation }
         $exePath = Resolve-InstalledExecutable -Entry $entry -BinaryName $BinaryName -TrustedInstallRoot $installDir
         if (-not $installDir) { $installDir = Split-Path -Parent $exePath }
         Write-Host "Installed executable: $exePath"
@@ -684,7 +685,7 @@ function Invoke-InstallerLifecycle {
                     $command = Get-UninstallCommand -Entry $entry -InstallerType $InstallerType -LogDir $logDir
                 }
                 if (-not $installDir) {
-                    $installDir = if ($entry.InstallLocation) { [string]$entry.InstallLocation } else { [string]$command.InstallRoot }
+                    $installDir = if ($command.InstallRoot) { [string]$command.InstallRoot } else { [string]$entry.InstallLocation }
                 }
                 Invoke-Uninstall -Command $command -EntryIdentity $entryIdentity -ExePath $exePath -TimeoutSeconds $UninstallTimeoutSeconds
             } catch {
