@@ -43,6 +43,10 @@ jobs:
         shell: pwsh
         run: ./.github/scripts/setup-openblas.ps1 -Target "x86_64-pc-windows-msvc"
 
+      - name: Install pkg-config
+        shell: pwsh
+        run: ./.github/scripts/setup-pkgconf.ps1 -Target "x86_64-pc-windows-msvc"
+
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
