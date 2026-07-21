@@ -41,7 +41,9 @@ export const HardwareInfo: React.FC = () => {
         )}
       </div>
       <div className="text-sm text-mid-gray">
-        {t("settings.advanced.hardware.cores", { count: hardwareInfo.cpu_cores })}
+        {t("settings.advanced.hardware.cores", {
+          count: hardwareInfo.cpu_cores,
+        })}
       </div>
     </div>
   );

@@ -348,7 +348,8 @@ export const ModelsSettings: React.FC = () => {
         return "available";
       }
       return "active";
-    }    const model = models.find((m: ModelInfo) => m.id === modelId);
+    }
+    const model = models.find((m: ModelInfo) => m.id === modelId);
     if (model?.is_downloaded) {
       return "available";
     }
@@ -763,9 +764,7 @@ export const ModelsSettings: React.FC = () => {
                 onKeyDown={(e) => {
                   if (e.key === "Enter") handleIfwSave();
                 }}
-                placeholder={t(
-                  "settings.insanelyFastWhisper.modelPlaceholder",
-                )}
+                placeholder={t("settings.insanelyFastWhisper.modelPlaceholder")}
                 className="w-full"
               />
             </div>
@@ -777,11 +776,7 @@ export const ModelsSettings: React.FC = () => {
               >
                 {t("settings.insanelyFastWhisper.cancel")}
               </Button>
-              <Button
-                variant="primary"
-                size="sm"
-                onClick={handleIfwSave}
-              >
+              <Button variant="primary" size="sm" onClick={handleIfwSave}>
                 {t("settings.insanelyFastWhisper.save")}
               </Button>
             </div>

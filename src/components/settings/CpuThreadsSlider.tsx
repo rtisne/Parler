@@ -34,7 +34,9 @@ export const CpuThreadsSlider: React.FC<CpuThreadsSliderProps> = ({
   return (
     <Slider
       value={cpuThreads}
-      onChange={(value: number) => updateSetting("cpu_threads", Math.round(value))}
+      onChange={(value: number) =>
+        updateSetting("cpu_threads", Math.round(value))
+      }
       min={1}
       max={maxThreads}
       step={1}
@@ -44,7 +46,9 @@ export const CpuThreadsSlider: React.FC<CpuThreadsSliderProps> = ({
       })}
       descriptionMode={descriptionMode}
       grouped={grouped}
-      formatValue={(value) => `${Math.round(value)} ${t("settings.advanced.cpuThreads.threads")}`}
+      formatValue={(value) =>
+        `${Math.round(value)} ${t("settings.advanced.cpuThreads.threads")}`
+      }
     />
   );
 };
