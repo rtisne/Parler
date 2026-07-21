@@ -36,11 +36,13 @@ Whisper models are now configured with the optimal `n_threads` parameter based o
 The system automatically recommends the best model based on your hardware:
 
 #### With GPU
+
 - **Recommended**: Whisper Turbo (1.6 GB)
 - Best transcription quality
 - Excellent speed thanks to GPU acceleration
 
 #### Without GPU (CPU-only)
+
 - **Recommended**: Parakeet V3 INT8 (478 MB)
 - 3-5x faster than Whisper on CPU
 - Quality comparable to Whisper Medium
@@ -50,10 +52,10 @@ The system automatically recommends the best model based on your hardware:
 
 Two new models have been added for CPU users who prefer Whisper:
 
-| Model | Size | Speed Score | Quality | Speed gain |
-|-------|------|-------------|---------|------------|
-| Whisper Small Q4 | 140 MB | 0.95 | Good | +30% vs standard Small |
-| Whisper Medium Q4 | 280 MB | 0.80 | Very good | +25% vs standard Medium |
+| Model             | Size   | Speed Score | Quality   | Speed gain              |
+| ----------------- | ------ | ----------- | --------- | ----------------------- |
+| Whisper Small Q4  | 140 MB | 0.95        | Good      | +30% vs standard Small  |
+| Whisper Medium Q4 | 280 MB | 0.80        | Very good | +25% vs standard Medium |
 
 These models use Q4_0 quantization (more aggressive than Q4_1) for maximum CPU performance.
 
@@ -93,14 +95,14 @@ Trois nouveaux paramètres sont disponibles dans les settings :
 
 ```typescript
 // Obtenir les informations matérielles
-const hwInfo = await invoke('get_hardware_info');
+const hwInfo = await invoke("get_hardware_info");
 // Retourne: { has_gpu: boolean, cpu_cores: number, recommended_threads: number }
 
 // Configurer le nombre de threads CPU
-await invoke('change_cpu_threads_setting', { threads: 6 });
+await invoke("change_cpu_threads_setting", { threads: 6 });
 
 // Activer/désactiver le préchargement
-await invoke('change_preload_model_setting', { enabled: true });
+await invoke("change_preload_model_setting", { enabled: true });
 ```
 
 ## Résultats attendus
@@ -108,10 +110,12 @@ await invoke('change_preload_model_setting', { enabled: true });
 ### Sur un PC d'entreprise typique (CPU i5/i7, pas de GPU)
 
 **Avant optimisations :**
+
 - Whisper Medium : ~30-40 secondes pour 30 secondes d'audio
 - Rechargement du modèle : 15-25 secondes
 
 **Après optimisations :**
+
 - Parakeet V3 (recommandé) : ~6-10 secondes pour 30 secondes d'audio
 - Whisper Medium Q4 : ~20-25 secondes pour 30 secondes d'audio
 - Pas de rechargement (modèle gardé en mémoire)
@@ -122,6 +126,7 @@ await invoke('change_preload_model_setting', { enabled: true });
 ### Sur un PC avec GPU
 
 Les performances restent excellentes sans changement :
+
 - Whisper Turbo recommandé par défaut
 - Accélération GPU maximale
 - Temps de transcription inchangé (~2-5 secondes)

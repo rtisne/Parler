@@ -14,6 +14,9 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Test translation baseline validator
+        run: bun run test:translations
+
       - name: Check translation consistency
         run: bun run check:translations
 

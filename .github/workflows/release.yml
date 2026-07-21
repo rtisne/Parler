@@ -84,7 +84,6 @@ jobs:
             target: "x86_64-pc-windows-msvc"
             apple_signing: false
 
-
     uses: ./.github/workflows/build.yml
     with:
       platform: ${{ matrix.platform }}
