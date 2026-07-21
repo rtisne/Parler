@@ -285,6 +285,10 @@ Describe "Get-BoundedLogContent" {
 }
 
 Describe "Invoke-BoundedProcess" {
+    BeforeEach {
+        Mock Register-ProcessJob { return $Process }
+    }
+
     It "kills the process tree and throws when the timeout expires" {
         $script:fakeProcess = New-FakeProcess -Completes $false
         Mock Start-Process { return $script:fakeProcess }
