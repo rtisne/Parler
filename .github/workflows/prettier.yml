@@ -3,13 +3,19 @@ on: [pull_request]
 
 jobs:
   prettier:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
+      - name: Preserve repository LF line endings
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v1
+      - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
