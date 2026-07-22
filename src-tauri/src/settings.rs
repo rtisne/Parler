@@ -407,6 +407,11 @@ pub struct AppSettings {
     /// Highest completed secret-store migration step (0 = none yet).
     #[serde(default)]
     pub secret_store_migration_version: u32,
+    /// Accepted consent version per cloud provider id (provider_id -> version).
+    /// A cloud target may only be selected once the accepted version is at least
+    /// the provider's current `consent_version`. Never carries a secret.
+    #[serde(default)]
+    pub cloud_provider_consents: HashMap<String, u32>,
 }
 
 impl std::fmt::Debug for AppSettings {
@@ -498,6 +503,7 @@ impl std::fmt::Debug for AppSettings {
                 "secret_store_migration_version",
                 &self.secret_store_migration_version,
             )
+            .field("cloud_provider_consents", &self.cloud_provider_consents)
             .finish()
     }
 }
@@ -935,6 +941,7 @@ pub fn get_default_settings() -> AppSettings {
         preload_model_on_startup: default_preload_model(),
         selected_transcription_target: None,
         secret_store_migration_version: 0,
+        cloud_provider_consents: HashMap::new(),
     }
 }
 

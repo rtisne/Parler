@@ -477,6 +477,12 @@ pub fn run(cli_args: CliArgs) {
         commands::secrets::set_provider_credential,
         commands::secrets::delete_provider_credential,
         commands::secrets::get_provider_credential_status,
+        commands::providers::get_cloud_transcription_providers,
+        commands::providers::get_selected_transcription_target,
+        commands::providers::set_selected_transcription_target,
+        commands::providers::set_cloud_provider_consent,
+        commands::providers::revoke_cloud_provider_consent,
+        commands::providers::get_cloud_provider_consents,
         commands::insanely_fast_whisper::change_insanely_fast_whisper_model_setting,
         commands::hardware::get_hardware_info,
         helpers::clamshell::is_laptop,
@@ -614,6 +620,15 @@ pub fn run(cli_args: CliArgs) {
                     }
                 }
             }
+
+            // Build the transcription provider registry (cloud targets). Local
+            // engines keep running through their existing manager path; the
+            // registry owns cloud providers and the serializable catalog.
+            let mut registry = crate::transcription::TranscriptionRegistry::new();
+            registry.register(std::sync::Arc::new(
+                crate::transcription::ElevenLabsProvider::new(),
+            ));
+            app.manage(std::sync::Arc::new(registry));
 
             initialize_core_logic(&app_handle);
 

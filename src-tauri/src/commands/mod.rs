@@ -4,6 +4,7 @@ pub mod hardware;
 pub mod history;
 pub mod insanely_fast_whisper;
 pub mod models;
+pub mod providers;
 pub mod secrets;
 pub mod transcription;
 
