@@ -581,10 +581,39 @@ pub fn run(cli_args: CliArgs) {
             app.manage(actions::ActiveActionState(std::sync::Mutex::new(None)));
 
             // Credentials managed through this store use the OS keyring
-            // exclusively. Legacy settings are migrated separately.
+            // exclusively (no plaintext fallback).
             let secret_store: crate::secrets::SharedSecretStore =
                 std::sync::Arc::new(crate::secrets::KeyringSecretStore::new());
-            app.manage(secret_store);
+            app.manage(secret_store.clone());
+
+            // One-time, non-destructive migration of legacy plaintext keys
+            // (Gemini + post-processing) from settings into the keyring. The
+            // legacy fields are intentionally left in place until a later
+            // transition version; see secrets::migration. No secret is logged.
+            if settings.secret_store_migration_version
+                < crate::secrets::migration::CURRENT_MIGRATION_VERSION
+            {
+                match crate::secrets::migration::copy_legacy_secrets(
+                    secret_store.as_ref(),
+                    &settings,
+                ) {
+                    Ok(report) => {
+                        log::info!(
+                            "Secret migration: copied {} legacy credential(s) to the keyring",
+                            report.migrated_accounts.len()
+                        );
+                        let mut persisted = get_settings(&app_handle);
+                        persisted.secret_store_migration_version =
+                            crate::secrets::migration::CURRENT_MIGRATION_VERSION;
+                        settings::write_settings(&app_handle, persisted);
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "Secret migration blocked ({err}); legacy values preserved, keyring not updated"
+                        );
+                    }
+                }
+            }
 
             initialize_core_logic(&app_handle);
 

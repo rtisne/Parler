@@ -400,6 +400,13 @@ pub struct AppSettings {
     pub cpu_threads: usize,
     #[serde(default = "default_preload_model")]
     pub preload_model_on_startup: bool,
+    /// Explicitly selected transcription target (local or cloud). `None` means
+    /// the legacy local `selected_model` is used. Never carries a secret.
+    #[serde(default)]
+    pub selected_transcription_target: Option<crate::transcription::types::TranscriptionTargetId>,
+    /// Highest completed secret-store migration step (0 = none yet).
+    #[serde(default)]
+    pub secret_store_migration_version: u32,
 }
 
 impl std::fmt::Debug for AppSettings {
@@ -483,6 +490,14 @@ impl std::fmt::Debug for AppSettings {
             .field("saved_processing_models", &self.saved_processing_models)
             .field("cpu_threads", &self.cpu_threads)
             .field("preload_model_on_startup", &self.preload_model_on_startup)
+            .field(
+                "selected_transcription_target",
+                &self.selected_transcription_target,
+            )
+            .field(
+                "secret_store_migration_version",
+                &self.secret_store_migration_version,
+            )
             .finish()
     }
 }
@@ -918,10 +933,24 @@ pub fn get_default_settings() -> AppSettings {
         saved_processing_models: Vec::new(),
         cpu_threads: default_cpu_threads(),
         preload_model_on_startup: default_preload_model(),
+        selected_transcription_target: None,
+        secret_store_migration_version: 0,
     }
 }
 
 impl AppSettings {
+    /// A copy safe to write to an export file: all credential material is
+    /// removed. `gemini_api_key` is cleared and every post-process API key value
+    /// is emptied while preserving the provider ids (which are not secret).
+    pub fn export_snapshot(&self) -> AppSettings {
+        let mut copy = self.clone();
+        copy.gemini_api_key = None;
+        for value in copy.post_process_api_keys.values_mut() {
+            value.clear();
+        }
+        copy
+    }
+
     pub fn active_post_process_provider(&self) -> Option<&PostProcessProvider> {
         self.post_process_providers
             .iter()
@@ -1087,5 +1116,21 @@ mod tests {
         assert!(
             output.contains("post_process_api_keys: {\"provider-id-sentinel\": \"[REDACTED]\"}")
         );
+    }
+
+    #[test]
+    fn export_snapshot_strips_all_secret_material() {
+        let mut settings = get_default_settings();
+        settings.gemini_api_key = Some("gemini-secret-sentinel".into());
+        settings.post_process_api_keys.clear();
+        settings
+            .post_process_api_keys
+            .insert("openai".into(), "openai-secret-sentinel".into());
+
+        let json = serde_json::to_string(&settings.export_snapshot()).unwrap();
+        assert!(!json.contains("gemini-secret-sentinel"));
+        assert!(!json.contains("openai-secret-sentinel"));
+        // Provider ids are preserved (not secret) so import keeps the layout.
+        assert!(json.contains("openai"));
     }
 }

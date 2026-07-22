@@ -15,6 +15,8 @@ use std::fmt;
 mod keyring_store;
 pub use keyring_store::KeyringSecretStore;
 
+pub mod migration;
+
 #[cfg(test)]
 mod memory_store;
 #[cfg(test)]

@@ -136,7 +136,8 @@ pub fn open_app_data_dir(app: AppHandle) -> Result<(), String> {
 #[specta::specta]
 #[tauri::command]
 pub fn export_settings(app: AppHandle, path: String) -> Result<(), String> {
-    let settings = get_settings(&app);
+    // Never export credential material: strip secrets before serializing.
+    let settings = get_settings(&app).export_snapshot();
     let json = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
     std::fs::write(&path, json).map_err(|e| format!("Failed to write file: {}", e))?;
