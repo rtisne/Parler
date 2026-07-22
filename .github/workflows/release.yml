@@ -31,29 +31,7 @@ jobs:
         shell: bash
         env:
           EXPECTED_VERSION: ${{ steps.get-version.outputs.version }}
-        run: |
-          node <<'NODE'
-          const fs = require("fs");
-          const expected = process.env.EXPECTED_VERSION;
-          const packageVersion = JSON.parse(fs.readFileSync("package.json", "utf8")).version;
-          const cargo = fs.readFileSync("src-tauri/Cargo.toml", "utf8");
-          const cargoVersion = cargo.match(/^version = "([^"]+)"$/m)?.[1];
-          const lock = fs.readFileSync("src-tauri/Cargo.lock", "utf8");
-          const lockVersion = lock.match(
-            /\[\[package\]\]\nname = "parler"\nversion = "([^"]+)"/,
-          )?.[1];
-          if (
-            !expected ||
-            packageVersion !== expected ||
-            cargoVersion !== expected ||
-            lockVersion !== expected
-          ) {
-            throw new Error(
-              `Version mismatch: tauri=${expected}, package=${packageVersion}, cargo=${cargoVersion}, lock=${lockVersion}`,
-            );
-          }
-          console.log(`Version consistency verified: ${expected}`);
-          NODE
+        run: node scripts/release-version-consistency.mjs
 
       - name: Create Draft Release
         id: create-release
