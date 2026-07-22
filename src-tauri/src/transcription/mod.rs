@@ -11,11 +11,13 @@
 //! providers and the serializable catalog surfaced to the UI.
 
 pub mod elevenlabs;
+pub mod gemini;
 pub mod provider;
 pub mod registry;
 pub mod types;
 
 pub use elevenlabs::ElevenLabsProvider;
+pub use gemini::GeminiProvider;
 pub use provider::TranscriptionProvider;
 pub use registry::TranscriptionRegistry;
 pub use types::{
