@@ -1,0 +1,10 @@
+{
+  "language_code": "fr",
+  "language_probability": 0.98,
+  "text": "Bonjour, ceci est une dictée de test.",
+  "words": [
+    { "text": "Bonjour", "start": 0.0, "end": 0.42, "type": "word", "speaker_id": null, "logprob": -0.04 },
+    { "text": " ", "start": 0.42, "end": 0.44, "type": "spacing", "speaker_id": null, "logprob": -0.01 },
+    { "text": "ceci", "start": 0.44, "end": 0.71, "type": "word", "speaker_id": null, "logprob": -0.02 }
+  ]
+}
