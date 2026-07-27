@@ -38,6 +38,16 @@ impl Drop for FinishGuard {
     }
 }
 
+/// A long-audio transcription is not successful until its temporary model
+/// switch has either been restored or legitimately superseded. Callers must
+/// evaluate this result before post-processing, paste, or history writes.
+fn finalize_long_audio_restore(outcome: RestoreOutcome) -> Result<(), String> {
+    match outcome {
+        RestoreOutcome::Restored | RestoreOutcome::Superseded => Ok(()),
+        RestoreOutcome::Failed(error) => Err(error),
+    }
+}
+
 // Shortcut Action Trait
 pub trait ShortcutAction: Send + Sync {
     fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
@@ -776,6 +786,38 @@ impl ShortcutAction for TranscribeAction {
                             }
                         }
 
+                        // The temporary long-audio model must be restored before
+                        // any success effect becomes observable. In particular,
+                        // do not post-process, paste, or save a successful history
+                        // entry when restoration failed and the local model state
+                        // is unknown.
+                        if switched_model {
+                            if let Some(ticket) = switch_ticket.take() {
+                                let mut guard = TicketGuard::new(tm.as_ref().clone(), ticket);
+                                if let Err(e) = finalize_long_audio_restore(guard.resolve()) {
+                                    error!(
+                                        "Failed to restore the local model state after a long-audio \
+                                         fallback switch: {}. Blocking transcription success because \
+                                         the local model state may now be inconsistent with the user's \
+                                         selection.",
+                                        e
+                                    );
+                                    let _ = ah.emit(
+                                        "model-state-changed",
+                                        crate::managers::transcription::ModelStateEvent {
+                                            event_type: "restore_failed".to_string(),
+                                            model_id: None,
+                                            model_name: None,
+                                            error: Some(e),
+                                        },
+                                    );
+                                    utils::hide_recording_overlay(&ah);
+                                    change_tray_icon(&ah, TrayIconState::Idle);
+                                    return;
+                                }
+                            }
+                        }
+
                         let mut post_processed_text: Option<String> = None;
                         let mut post_process_prompt: Option<String> = None;
 
@@ -934,15 +976,9 @@ impl ShortcutAction for TranscribeAction {
                     }
                 }
 
-                // Restore whatever was loaded before this function's own
-                // switch. The ticket carries its own baseline (which may be
-                // "nothing was loaded", not just some other model id), so
-                // this always attempts the correct restore regardless of the
-                // unload-timeout setting: if that setting caused an
-                // immediate auto-unload during transcription, the ticket
-                // simply comes back `Superseded` (a real, explicit slot
-                // change happened after it was opened) rather than
-                // incorrectly reloading something.
+                // A failed transcription still has to resolve any temporary
+                // switch. The successful path already consumed its ticket
+                // before post-processing, paste, and history effects above.
                 if switched_model {
                     if let Some(ticket) = switch_ticket.take() {
                         let mut guard = TicketGuard::new(tm.as_ref().clone(), ticket);
@@ -978,6 +1014,31 @@ impl ShortcutAction for TranscribeAction {
         debug!(
             "TranscribeAction::stop completed in {:?}",
             stop_time.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod long_audio_restore_tests {
+    use super::{finalize_long_audio_restore, RestoreOutcome};
+
+    #[test]
+    fn restored_or_superseded_restore_allows_long_audio_success_effects() {
+        assert_eq!(
+            finalize_long_audio_restore(RestoreOutcome::Restored),
+            Ok(())
+        );
+        assert_eq!(
+            finalize_long_audio_restore(RestoreOutcome::Superseded),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn failed_restore_blocks_long_audio_success_effects() {
+        assert_eq!(
+            finalize_long_audio_restore(RestoreOutcome::Failed("restore failed".to_string())),
+            Err("restore failed".to_string())
         );
     }
 }
