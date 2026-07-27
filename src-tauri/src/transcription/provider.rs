@@ -26,7 +26,15 @@ pub trait TranscriptionProvider: Send + Sync {
     /// the OS keyring and passed in; the provider never reads it from settings.
     async fn transcribe(
         &self,
+        model_id: &str,
         request: &TranscriptionRequest,
         api_key: &str,
     ) -> Result<TranscriptionResult, TranscriptionError>;
+
+    /// Validate a configured credential without uploading audio.
+    async fn test_connection(&self, _api_key: &str) -> Result<(), TranscriptionError> {
+        Err(TranscriptionError::InvalidConfiguration(
+            "connection test is not supported for this provider".into(),
+        ))
+    }
 }

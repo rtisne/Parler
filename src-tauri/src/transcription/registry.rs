@@ -5,7 +5,7 @@
 //! implicit switch between targets.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use super::provider::TranscriptionProvider;
 use super::types::{ProviderDescriptor, TranscriptionError, TranscriptionTargetId};
@@ -13,7 +13,7 @@ use super::types::{ProviderDescriptor, TranscriptionError, TranscriptionTargetId
 /// Holds every registered [`TranscriptionProvider`] keyed by provider id.
 #[derive(Clone, Default)]
 pub struct TranscriptionRegistry {
-    providers: HashMap<String, Arc<dyn TranscriptionProvider>>,
+    providers: Arc<RwLock<HashMap<String, Arc<dyn TranscriptionProvider>>>>,
 }
 
 impl TranscriptionRegistry {
@@ -22,20 +22,32 @@ impl TranscriptionRegistry {
     }
 
     /// Register (or replace) a provider. The provider's descriptor id is the key.
-    pub fn register(&mut self, provider: Arc<dyn TranscriptionProvider>) {
+    pub fn register(&self, provider: Arc<dyn TranscriptionProvider>) {
         let id = provider.descriptor().id;
-        self.providers.insert(id, provider);
+        self.providers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(id, provider);
     }
 
     /// Look up a provider by id without validating a model.
     pub fn get(&self, provider_id: &str) -> Option<Arc<dyn TranscriptionProvider>> {
-        self.providers.get(provider_id).cloned()
+        self.providers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(provider_id)
+            .cloned()
     }
 
     /// Serializable descriptors for every registered provider, for the UI
     /// catalog. Order is not guaranteed; the frontend sorts for display.
     pub fn descriptors(&self) -> Vec<ProviderDescriptor> {
-        self.providers.values().map(|p| p.descriptor()).collect()
+        self.providers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .map(|p| p.descriptor())
+            .collect()
     }
 
     /// Resolve a target to its provider, verifying the provider exists and
@@ -135,6 +147,7 @@ mod tests {
                     privacy_url: None,
                     pricing_url: None,
                     cost_text: None,
+                    retention_text: None,
                     consent_version: 1,
                     beta: false,
                 },
@@ -150,6 +163,7 @@ mod tests {
 
         async fn transcribe(
             &self,
+            _model_id: &str,
             _request: &TranscriptionRequest,
             _api_key: &str,
         ) -> Result<TranscriptionResult, TranscriptionError> {
@@ -158,7 +172,7 @@ mod tests {
     }
 
     fn registry_with_elevenlabs() -> TranscriptionRegistry {
-        let mut registry = TranscriptionRegistry::new();
+        let registry = TranscriptionRegistry::new();
         registry.register(FakeProvider::cloud(
             "elevenlabs",
             "scribe_v2",
@@ -180,7 +194,10 @@ mod tests {
     fn unknown_provider_is_an_error_not_a_fallback() {
         let registry = registry_with_elevenlabs();
         let target = TranscriptionTargetId::new("does-not-exist", "scribe_v2");
-        let err = registry.resolve(&target).unwrap_err();
+        let err = registry
+            .resolve(&target)
+            .err()
+            .expect("an unknown provider must be rejected");
         assert_eq!(err.category(), "invalid_configuration");
     }
 
@@ -188,16 +205,22 @@ mod tests {
     fn unknown_model_is_rejected() {
         let registry = registry_with_elevenlabs();
         let target = TranscriptionTargetId::new("elevenlabs", "scribe_v99");
-        let err = registry.resolve(&target).unwrap_err();
+        let err = registry
+            .resolve(&target)
+            .err()
+            .expect("an unknown model must be rejected");
         assert_eq!(err.category(), "invalid_configuration");
     }
 
     #[test]
     fn batch_unsupported_capability_is_rejected() {
-        let mut registry = TranscriptionRegistry::new();
+        let registry = TranscriptionRegistry::new();
         registry.register(FakeProvider::cloud("stream-only", "m", vec![], false));
         let target = TranscriptionTargetId::new("stream-only", "m");
-        let err = registry.resolve_for_batch(&target, None).unwrap_err();
+        let err = registry
+            .resolve_for_batch(&target, None)
+            .err()
+            .expect("a stream-only provider must reject batch requests");
         assert_eq!(err.category(), "invalid_configuration");
     }
 
@@ -205,7 +228,10 @@ mod tests {
     fn unsupported_language_is_rejected() {
         let registry = registry_with_elevenlabs();
         let target = TranscriptionTargetId::new("elevenlabs", "scribe_v2");
-        let err = registry.resolve_for_batch(&target, Some("zz")).unwrap_err();
+        let err = registry
+            .resolve_for_batch(&target, Some("zz"))
+            .err()
+            .expect("an unsupported language must be rejected");
         assert_eq!(err.category(), "unsupported_language");
     }
 
@@ -224,5 +250,21 @@ mod tests {
         let target = TranscriptionTargetId::new("elevenlabs", "scribe_v2");
         assert!(registry.resolve(&target).is_err());
         assert!(registry.descriptors().is_empty());
+    }
+
+    #[test]
+    fn registering_the_same_provider_replaces_its_model_for_every_clone() {
+        let registry = TranscriptionRegistry::new();
+        registry.register(FakeProvider::cloud("gemini", "old-model", vec![], true));
+        let shared = registry.clone();
+
+        shared.register(FakeProvider::cloud("gemini", "new-model", vec![], true));
+
+        assert!(registry
+            .resolve(&TranscriptionTargetId::new("gemini", "new-model"))
+            .is_ok());
+        assert!(registry
+            .resolve(&TranscriptionTargetId::new("gemini", "old-model"))
+            .is_err());
     }
 }

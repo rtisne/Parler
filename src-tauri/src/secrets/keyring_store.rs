@@ -5,7 +5,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use keyring::{Entry, Error as KeyringError};
 
-use super::{provider_account, SecretStore, SecretStoreError, SECRET_SERVICE};
+use super::{normalize_secret, provider_account, SecretStore, SecretStoreError, SECRET_SERVICE};
 
 /// Reserved account used only to probe backend availability. It is never
 /// written, so a healthy backend reports it as absent (`NoEntry`).
@@ -75,9 +75,10 @@ fn map_set_error(error: KeyringError) -> SecretStoreError {
 
 impl SecretStore for KeyringSecretStore {
     fn set_secret(&self, provider_id: &str, secret: &str) -> Result<(), SecretStoreError> {
+        let secret = normalize_secret(secret)?;
         let _guard = self.lock()?;
         self.entry(provider_id)?
-            .set_password(secret)
+            .set_password(&secret)
             .map_err(map_set_error)
     }
 
@@ -126,6 +127,19 @@ mod tests {
             format!("{:?}", KeyringSecretStore::new()),
             "KeyringSecretStore"
         );
+    }
+
+    #[test]
+    fn set_secret_rejects_blank_value_without_touching_the_backend() {
+        // No live backend is required here: normalization runs before any
+        // keyring access, so this must fail the same way in CI/headless runs.
+        let store = KeyringSecretStore::new();
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                store.set_secret("parler-test-provider", blank),
+                Err(SecretStoreError::InvalidSecret)
+            );
+        }
     }
 
     #[test]

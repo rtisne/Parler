@@ -5,10 +5,9 @@
 //! by unit tests against a local mock server. The API key is passed in by the
 //! caller (fetched from the keyring), never read from settings here.
 //!
-//! Note: the existing local Gemini path in `managers::transcription` is left
-//! unchanged in this milestone to avoid regressing the working pipeline; this
-//! provider is the migration target for that path in a later step. It is not yet
-//! registered in the live registry, so both paths never run for one request.
+//! The legacy `gemini-api` model id remains supported by
+//! `managers::transcription`; new explicit cloud targets use this provider.
+//! Both paths read the same keyring credential and only the selected path runs.
 
 use std::io::Cursor;
 use std::time::{Duration, Instant};
@@ -47,6 +46,12 @@ impl GeminiProvider {
             DEFAULT_MODEL.to_string(),
             DEFAULT_TIMEOUT,
         )
+    }
+
+    /// Build a provider for the model selected in settings instead of silently
+    /// replacing it with the default catalog model.
+    pub fn with_model(model: impl Into<String>) -> Self {
+        Self::build(DEFAULT_BASE_URL.to_string(), model.into(), DEFAULT_TIMEOUT)
     }
 
     fn build(base_url: String, model: String, timeout: Duration) -> Self {
@@ -98,6 +103,7 @@ pub fn descriptor() -> ProviderDescriptor {
         privacy_url: Some("https://ai.google.dev/gemini-api/terms".to_string()),
         pricing_url: Some("https://ai.google.dev/pricing".to_string()),
         cost_text: None,
+        retention_text: Some("Retention follows your Google account and provider policy.".into()),
         consent_version: 1,
         beta: false,
     }
@@ -225,14 +231,26 @@ fn parse_response(body: &str) -> Result<String, TranscriptionError> {
 #[async_trait]
 impl TranscriptionProvider for GeminiProvider {
     fn descriptor(&self) -> ProviderDescriptor {
-        descriptor()
+        let mut descriptor = descriptor();
+        descriptor.models = vec![TranscriptionModelDescriptor {
+            id: self.model.clone(),
+            label: self.model.clone(),
+        }];
+        descriptor
     }
 
     async fn transcribe(
         &self,
+        model_id: &str,
         request: &TranscriptionRequest,
         api_key: &str,
     ) -> Result<TranscriptionResult, TranscriptionError> {
+        if model_id != self.model {
+            return Err(TranscriptionError::InvalidConfiguration(
+                "Gemini model does not match the registered target".into(),
+            ));
+        }
+        let api_key = api_key.trim();
         if api_key.is_empty() {
             return Err(TranscriptionError::MissingCredential);
         }
@@ -242,7 +260,7 @@ impl TranscriptionProvider for GeminiProvider {
         let audio_base64 = base64::engine::general_purpose::STANDARD.encode(&wav);
         let payload = build_request(audio_base64);
 
-        let url = format!("{}/models/{}:generateContent", self.base_url, self.model);
+        let url = format!("{}/models/{model_id}:generateContent", self.base_url);
         let response = self
             .http
             .post(&url)
@@ -262,7 +280,8 @@ impl TranscriptionProvider for GeminiProvider {
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            let _ = response.text().await;
+            // Never read the body: not logged/surfaced, and an unbounded
+            // remote body must not force an unbounded allocation here.
             let err = map_status_error(status);
             warn!("gemini failed: http {} -> {}", status, err.category());
             return Err(err);
@@ -286,6 +305,31 @@ impl TranscriptionProvider for GeminiProvider {
             detected_language: None,
             latency,
         })
+    }
+
+    async fn test_connection(&self, api_key: &str) -> Result<(), TranscriptionError> {
+        if api_key.trim().is_empty() {
+            return Err(TranscriptionError::MissingCredential);
+        }
+        let response = self
+            .http
+            .get(format!("{}/models/{}", self.base_url, self.model))
+            .header("x-goog-api-key", api_key.trim())
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    TranscriptionError::Timeout
+                } else {
+                    TranscriptionError::ProviderUnavailable
+                }
+            })?;
+        let status = response.status().as_u16();
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(map_status_error(status))
+        }
     }
 }
 
@@ -386,10 +430,25 @@ mod tests {
     }
 
     #[test]
+    fn configured_model_is_preserved_in_descriptor() {
+        let provider = GeminiProvider::with_model("gemini-custom-preview");
+        assert_eq!(provider.descriptor().models[0].id, "gemini-custom-preview");
+    }
+
+    #[test]
     fn empty_api_key_is_missing_credential() {
         let provider = GeminiProvider::with_base_url("http://127.0.0.1:1");
         let err = runtime()
-            .block_on(provider.transcribe(&sample_request(), ""))
+            .block_on(provider.transcribe(DEFAULT_MODEL, &sample_request(), ""))
+            .unwrap_err();
+        assert_eq!(err, TranscriptionError::MissingCredential);
+    }
+
+    #[test]
+    fn whitespace_only_api_key_is_missing_credential() {
+        let provider = GeminiProvider::with_base_url("http://127.0.0.1:1");
+        let err = runtime()
+            .block_on(provider.transcribe(DEFAULT_MODEL, &sample_request(), "   \t  "))
             .unwrap_err();
         assert_eq!(err, TranscriptionError::MissingCredential);
     }
@@ -399,13 +458,30 @@ mod tests {
         let (base, captured) = spawn_mock(http_response("200 OK", SUCCESS_BODY), None);
         let provider = GeminiProvider::with_base_url(base);
         let result = runtime()
-            .block_on(provider.transcribe(&sample_request(), "gem-key"))
+            .block_on(provider.transcribe(DEFAULT_MODEL, &sample_request(), "gem-key"))
             .unwrap();
         assert_eq!(result.text, "Bonjour le monde.");
         assert_eq!(result.provider_id, "gemini");
         let request = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
         assert!(request.to_lowercase().contains("x-goog-api-key"));
         assert!(request.contains("gem-key"));
+    }
+
+    #[test]
+    fn api_key_with_surrounding_whitespace_is_sent_trimmed() {
+        let (base, captured) = spawn_mock(http_response("200 OK", SUCCESS_BODY), None);
+        let provider = GeminiProvider::with_base_url(base);
+        runtime()
+            .block_on(provider.transcribe(DEFAULT_MODEL, &sample_request(), "  gem-key  "))
+            .unwrap();
+        let request = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(request.contains("gem-key"));
+        // The header line must carry exactly the trimmed value, not padding.
+        let header_line = request
+            .lines()
+            .find(|line| line.to_lowercase().starts_with("x-goog-api-key"))
+            .expect("api key header missing");
+        assert_eq!(header_line.trim(), "x-goog-api-key: gem-key");
     }
 
     #[test]
@@ -416,7 +492,7 @@ mod tests {
         );
         let provider = GeminiProvider::with_base_url(base);
         let err = runtime()
-            .block_on(provider.transcribe(&sample_request(), "bad"))
+            .block_on(provider.transcribe(DEFAULT_MODEL, &sample_request(), "bad"))
             .unwrap_err();
         assert_eq!(err, TranscriptionError::Authentication);
     }
@@ -426,7 +502,7 @@ mod tests {
         let (base, _) = spawn_mock(http_response("429 Too Many Requests", "{}"), None);
         let provider = GeminiProvider::with_base_url(base);
         let err = runtime()
-            .block_on(provider.transcribe(&sample_request(), "k"))
+            .block_on(provider.transcribe(DEFAULT_MODEL, &sample_request(), "k"))
             .unwrap_err();
         assert_eq!(err, TranscriptionError::RateLimited);
     }
@@ -436,7 +512,7 @@ mod tests {
         let (base, _) = spawn_mock(http_response("500 Internal Server Error", "{}"), None);
         let provider = GeminiProvider::with_base_url(base);
         let err = runtime()
-            .block_on(provider.transcribe(&sample_request(), "k"))
+            .block_on(provider.transcribe(DEFAULT_MODEL, &sample_request(), "k"))
             .unwrap_err();
         assert_eq!(err, TranscriptionError::ProviderUnavailable);
     }
@@ -449,8 +525,71 @@ mod tests {
         );
         let provider = GeminiProvider::with_base_url_and_timeout(base, Duration::from_millis(120));
         let err = runtime()
-            .block_on(provider.transcribe(&sample_request(), "k"))
+            .block_on(provider.transcribe(DEFAULT_MODEL, &sample_request(), "k"))
             .unwrap_err();
         assert_eq!(err, TranscriptionError::Timeout);
+    }
+
+    /// Send headers for a non-2xx status with a large declared `Content-Length`
+    /// but never send the body, holding the connection open for `hold_open`.
+    /// A bounded `tokio::time::timeout` around the call proves the client
+    /// never attempts to read the body.
+    fn spawn_mock_undelivered_body(status_line: &str, hold_open: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
+                let mut buf = [0u8; 4096];
+                loop {
+                    match socket.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: 10485760\r\n\r\n",
+                    status_line
+                );
+                let _ = socket.write_all(header.as_bytes());
+                let _ = socket.flush();
+                std::thread::sleep(hold_open);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn error_with_undelivered_body_does_not_block_transcribe() {
+        let base =
+            spawn_mock_undelivered_body("500 Internal Server Error", Duration::from_millis(500));
+        let provider = GeminiProvider::with_base_url(base);
+        let outcome = runtime().block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                provider.transcribe(DEFAULT_MODEL, &sample_request(), "k"),
+            )
+            .await
+        });
+        let err = outcome
+            .expect("must not block waiting on an undelivered error body")
+            .unwrap_err();
+        assert_eq!(err, TranscriptionError::ProviderUnavailable);
+    }
+
+    #[test]
+    fn error_with_undelivered_body_does_not_block_test_connection() {
+        let base =
+            spawn_mock_undelivered_body("500 Internal Server Error", Duration::from_millis(500));
+        let provider = GeminiProvider::with_base_url(base);
+        let outcome = runtime().block_on(async {
+            tokio::time::timeout(Duration::from_millis(200), provider.test_connection("k")).await
+        });
+        let err = outcome
+            .expect("must not block waiting on an undelivered error body")
+            .unwrap_err();
+        assert_eq!(err, TranscriptionError::ProviderUnavailable);
     }
 }

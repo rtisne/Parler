@@ -5,21 +5,23 @@
 //! [`TranscriptionRegistry`] maps a [`TranscriptionTargetId`] to a concrete
 //! [`TranscriptionProvider`] that returns a normalized [`TranscriptionResult`].
 //!
-//! The module is free of any `transcribe-rs` dependency so it compiles and is
-//! unit-tested under the CI mock build. Local engines keep running through their
-//! existing, proven path in `managers::transcription`; this module owns cloud
-//! providers and the serializable catalog surfaced to the UI.
+//! Local engines are isolated behind the manager's `LocalProvider`; cloud
+//! implementations are registered here.
 
 pub mod elevenlabs;
 pub mod gemini;
+
 pub mod provider;
 pub mod registry;
+pub mod service;
 pub mod types;
 
 pub use elevenlabs::ElevenLabsProvider;
 pub use gemini::GeminiProvider;
+
 pub use provider::TranscriptionProvider;
 pub use registry::TranscriptionRegistry;
+pub use service::TranscriptionService;
 pub use types::{
     ProviderCapabilities, ProviderDescriptor, ProviderKind, TranscriptionError,
     TranscriptionLatency, TranscriptionModelDescriptor, TranscriptionRequest, TranscriptionResult,

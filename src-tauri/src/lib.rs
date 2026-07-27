@@ -115,7 +115,7 @@ pub(crate) fn show_main_window(app: &AppHandle) {
     }
 }
 
-fn initialize_core_logic(app_handle: &AppHandle) {
+fn initialize_core_logic(app_handle: &AppHandle) -> Arc<TranscriptionManager> {
     // Note: Enigo (keyboard/mouse simulation) is NOT initialized here.
     // The frontend is responsible for calling the `initialize_enigo` command
     // after onboarding completes. This avoids triggering permission dialogs
@@ -248,6 +248,8 @@ fn initialize_core_logic(app_handle: &AppHandle) {
 
     // Create the recording overlay window (hidden by default)
     utils::create_recording_overlay(app_handle);
+
+    transcription_manager
 }
 
 fn shutdown_core_logic(app_handle: &AppHandle, reason: &str) {
@@ -439,6 +441,7 @@ pub fn run(cli_args: CliArgs) {
         commands::initialize_enigo,
         commands::initialize_shortcuts,
         commands::models::get_available_models,
+        commands::models::get_transcription_targets,
         commands::models::get_model_info,
         commands::models::download_model,
         commands::models::delete_model,
@@ -472,12 +475,14 @@ pub fn run(cli_args: CliArgs) {
         commands::history::update_history_limit,
         commands::history::update_recording_retention_period,
         commands::history::reprocess_history_entry,
+        commands::history::retry_cloud_history_entry,
         commands::gemini::change_gemini_api_key_setting,
         commands::gemini::change_gemini_model_setting,
         commands::secrets::set_provider_credential,
         commands::secrets::delete_provider_credential,
         commands::secrets::get_provider_credential_status,
         commands::providers::get_cloud_transcription_providers,
+        commands::providers::test_cloud_provider_connection,
         commands::providers::get_selected_transcription_target,
         commands::providers::set_selected_transcription_target,
         commands::providers::set_cloud_provider_consent,
@@ -592,10 +597,9 @@ pub fn run(cli_args: CliArgs) {
                 std::sync::Arc::new(crate::secrets::KeyringSecretStore::new());
             app.manage(secret_store.clone());
 
-            // One-time, non-destructive migration of legacy plaintext keys
-            // (Gemini + post-processing) from settings into the keyring. The
-            // legacy fields are intentionally left in place until a later
-            // transition version; see secrets::migration. No secret is logged.
+            // One-time migration of legacy plaintext keys (Gemini +
+            // post-processing) into the keyring. Plaintext is cleared only
+            // after every keyring write succeeds. No secret is logged.
             if settings.secret_store_migration_version
                 < crate::secrets::migration::CURRENT_MIGRATION_VERSION
             {
@@ -605,32 +609,46 @@ pub fn run(cli_args: CliArgs) {
                 ) {
                     Ok(report) => {
                         log::info!(
-                            "Secret migration: copied {} legacy credential(s) to the keyring",
+                            "Secret migration: moved {} legacy credential(s) to the keyring",
                             report.migrated_accounts.len()
                         );
                         let mut persisted = get_settings(&app_handle);
+                        crate::secrets::migration::clear_legacy_plaintext(&mut persisted);
                         persisted.secret_store_migration_version =
                             crate::secrets::migration::CURRENT_MIGRATION_VERSION;
                         settings::write_settings(&app_handle, persisted);
                     }
                     Err(err) => {
                         log::warn!(
-                            "Secret migration blocked ({err}); legacy values preserved, keyring not updated"
+                            "Secret migration blocked ({err}); legacy values preserved and migration will retry"
                         );
                     }
                 }
             }
 
-            // Build the transcription provider registry (cloud targets). Local
-            // engines keep running through their existing manager path; the
-            // registry owns cloud providers and the serializable catalog.
-            let mut registry = crate::transcription::TranscriptionRegistry::new();
+            let transcription_manager = initialize_core_logic(&app_handle);
+
+            // Build the shared batch transcription provider registry. The
+            // local provider is the same instance owned by TranscriptionManager,
+            // preserving model lifecycle while routing every target through
+            // TranscriptionService with no implicit fallback.
+            let registry = crate::transcription::TranscriptionRegistry::new();
+            registry.register(transcription_manager.provider());
             registry.register(std::sync::Arc::new(
                 crate::transcription::ElevenLabsProvider::new(),
             ));
-            app.manage(std::sync::Arc::new(registry));
-
-            initialize_core_logic(&app_handle);
+            registry.register(std::sync::Arc::new(
+                crate::transcription::GeminiProvider::with_model(settings.gemini_model.clone()),
+            ));
+            let registry = std::sync::Arc::new(registry);
+            let transcription_service = std::sync::Arc::new(
+                crate::transcription::TranscriptionService::new(
+                    registry.clone(),
+                    secret_store.clone(),
+                ),
+            );
+            app.manage(registry);
+            app.manage(transcription_service);
 
             // Hide tray icon if --no-tray was passed
             if cli_args.no_tray {

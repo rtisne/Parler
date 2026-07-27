@@ -5,14 +5,9 @@
 //! into the [`SecretStore`] under a stable, provider-scoped account so the new
 //! provider abstraction reads credentials only from the keyring.
 //!
-//! **Non-destructive by design in this milestone:** the copy step does not yet
-//! remove the values from settings. Destructive removal of the legacy fields is
-//! deferred to a later transition version, once every live read path (including
-//! the local Gemini transcription branch) sources its key from the keyring.
-//! Until then the copy makes the keyring authoritative for the new architecture
-//! without breaking the existing pipeline. No secret value is ever logged.
-
-use log::warn;
+//! The caller clears the legacy fields only after **all** keyring writes succeed.
+//! Every live read path uses the keyring, so there is no plaintext fallback.
+//! No secret value is ever logged.
 
 use super::{provider_account, SecretStore, SecretStoreError};
 use crate::settings::AppSettings;
@@ -26,7 +21,7 @@ pub const POST_PROCESS_ACCOUNT_PREFIX: &str = "postprocess-";
 /// Highest migration step implemented. Persisted as
 /// `secret_store_migration_version` once the step completes; bumping it re-runs
 /// the (idempotent) copy.
-pub const CURRENT_MIGRATION_VERSION: u32 = 1;
+pub const CURRENT_MIGRATION_VERSION: u32 = 2;
 
 /// Result of a migration pass. Contains only account names, never values.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -36,37 +31,93 @@ pub struct MigrationReport {
 
 /// Copy every non-empty legacy secret in `settings` into `store`.
 ///
-/// Idempotent: re-running overwrites with the same value. On the first backend
-/// error the pass stops and returns it, leaving already-written accounts in
-/// place (the caller must not mark the migration complete). Accounts with an
-/// invalid provider id are skipped with a warning rather than aborting.
+/// All account names and current keyring values are validated/read before the
+/// first write. If a later write fails, every account already changed by this
+/// pass is restored to its original value (or deleted when it did not exist).
+/// The caller must not clear plaintext or mark the migration complete on any
+/// error, including rollback failure.
 pub fn copy_legacy_secrets(
     store: &dyn SecretStore,
     settings: &AppSettings,
 ) -> Result<MigrationReport, SecretStoreError> {
-    let mut report = MigrationReport::default();
+    let mut pending = Vec::<(String, String)>::new();
 
-    if let Some(key) = settings.gemini_api_key.as_deref() {
-        if !key.is_empty() {
-            store.set_secret(GEMINI_ACCOUNT, key)?;
-            report.migrated_accounts.push(GEMINI_ACCOUNT.to_string());
-        }
+    if let Some(key) = settings
+        .gemini_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        pending.push((GEMINI_ACCOUNT.to_string(), key.to_string()));
     }
 
     for (provider_id, key) in &settings.post_process_api_keys {
+        let key = key.trim();
         if key.is_empty() {
             continue;
         }
         let account = format!("{POST_PROCESS_ACCOUNT_PREFIX}{provider_id}");
-        if provider_account(&account).is_err() {
-            warn!("Skipping migration of post-process key with unsupported provider id");
-            continue;
-        }
-        store.set_secret(&account, key)?;
-        report.migrated_accounts.push(account);
+        // Validate every account before any keyring mutation. Unsupported
+        // legacy identifiers abort rather than silently destroying data.
+        provider_account(&account)?;
+        pending.push((account, key.to_string()));
     }
 
-    Ok(report)
+    let mut originals = Vec::with_capacity(pending.len());
+    for (account, _) in &pending {
+        let original = match store.get_secret(account) {
+            Ok(value) => Some(value),
+            Err(SecretStoreError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        originals.push(original);
+    }
+
+    let mut written = 0usize;
+    for (account, value) in &pending {
+        if let Err(error) = store.set_secret(account, value) {
+            let mut rollback_failed = false;
+            for index in (0..written).rev() {
+                let account = &pending[index].0;
+                // `set_secret` now rejects blank/whitespace-only values
+                // (`normalize_secret`), but a pre-existing keyring entry
+                // written before that guard existed may itself be blank.
+                // Restoring such an original via `set_secret` would fail and
+                // strand the newly migrated value in place despite the
+                // overall rollback being reported as failed. A blank
+                // original carries no real secret (see `is_configured`'s
+                // same treatment), so deleting it reproduces its practical
+                // pre-migration state without going through the rejected
+                // write path.
+                let rollback = match &originals[index] {
+                    Some(original) if !original.trim().is_empty() => {
+                        store.set_secret(account, original)
+                    }
+                    Some(_) | None => store.delete_secret(account),
+                };
+                rollback_failed |= rollback.is_err();
+            }
+            return Err(if rollback_failed {
+                SecretStoreError::BackendFailure
+            } else {
+                error
+            });
+        }
+        written += 1;
+    }
+
+    Ok(MigrationReport {
+        migrated_accounts: pending.into_iter().map(|(account, _)| account).collect(),
+    })
+}
+
+/// Remove all credential values from settings after a successful copy pass.
+/// Provider ids remain so existing settings UI layout is preserved.
+pub fn clear_legacy_plaintext(settings: &mut AppSettings) {
+    settings.gemini_api_key = None;
+    for value in settings.post_process_api_keys.values_mut() {
+        value.clear();
+    }
 }
 
 #[cfg(test)]
@@ -154,5 +205,95 @@ mod tests {
         let settings = settings_with_legacy_secrets();
         let err = copy_legacy_secrets(&store, &settings).unwrap_err();
         assert!(!format!("{err}").contains("gemini-legacy-key"));
+    }
+
+    #[test]
+    fn partial_failure_restores_preexisting_values_and_deletes_new_entries() {
+        let store = MemorySecretStore::new();
+        store
+            .set_secret(GEMINI_ACCOUNT, "preexisting-gemini")
+            .unwrap();
+        let mut settings = settings_with_legacy_secrets();
+        settings
+            .post_process_api_keys
+            .insert("mistral".into(), "mistral-legacy-key".into());
+        store.set_fail_once_after_writes(2);
+
+        assert!(copy_legacy_secrets(&store, &settings).is_err());
+        assert_eq!(
+            store.get_secret(GEMINI_ACCOUNT).unwrap(),
+            "preexisting-gemini"
+        );
+        assert_eq!(
+            store.get_secret("postprocess-openai"),
+            Err(SecretStoreError::NotFound)
+        );
+        assert_eq!(
+            store.get_secret("postprocess-mistral"),
+            Err(SecretStoreError::NotFound)
+        );
+    }
+
+    #[test]
+    fn partial_failure_restores_a_blank_legacy_original_by_deleting_it() {
+        // A pre-existing keyring entry written before `set_secret` started
+        // rejecting blanks (e.g. an older build). The rollback must not call
+        // `set_secret` with this raw value -- that would itself fail now --
+        // and must not report success while leaving the newly migrated value
+        // in place.
+        //
+        // Note: the injected write failure below is itself reported as
+        // `SecretStoreError::BackendFailure` (see `MemorySecretStore`), the
+        // same variant `copy_legacy_secrets` also returns when a *rollback*
+        // fails -- so the top-level `Err` variant can't distinguish "the
+        // primary write failed as intended" from "rollback also failed" in
+        // this harness. The real, unambiguous signal is the store's final
+        // state, which is what this test actually asserts on.
+        let store = MemorySecretStore::new();
+        store.seed_raw(GEMINI_ACCOUNT, "   ");
+        let mut settings = settings_with_legacy_secrets();
+        settings
+            .post_process_api_keys
+            .insert("mistral".into(), "mistral-legacy-key".into());
+        // Fail after the Gemini write (index 0) succeeds, so its rollback
+        // must restore the blank original.
+        store.set_fail_once_after_writes(1);
+
+        assert!(copy_legacy_secrets(&store, &settings).is_err());
+        // The blank original is restored by deletion: no secret configured,
+        // and critically not the newly migrated legacy key left stranded.
+        assert_eq!(
+            store.get_secret(GEMINI_ACCOUNT),
+            Err(SecretStoreError::NotFound)
+        );
+    }
+
+    #[test]
+    fn invalid_account_aborts_before_any_write() {
+        let store = MemorySecretStore::new();
+        let mut settings = settings_with_legacy_secrets();
+        settings
+            .post_process_api_keys
+            .insert("unsupported/provider".into(), "must-not-be-lost".into());
+
+        assert_eq!(
+            copy_legacy_secrets(&store, &settings),
+            Err(SecretStoreError::InvalidProviderId)
+        );
+        assert_eq!(
+            store.get_secret(GEMINI_ACCOUNT),
+            Err(SecretStoreError::NotFound)
+        );
+    }
+
+    #[test]
+    fn plaintext_is_cleared_only_by_explicit_success_step() {
+        let mut settings = settings_with_legacy_secrets();
+        clear_legacy_plaintext(&mut settings);
+        assert!(settings.gemini_api_key.is_none());
+        assert!(settings
+            .post_process_api_keys
+            .values()
+            .all(String::is_empty));
     }
 }

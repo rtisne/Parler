@@ -13,11 +13,14 @@ import { ModelCard } from "@/components/onboarding";
 import { useModelStore } from "@/stores/modelStore";
 import { useSettings } from "@/hooks/useSettings";
 import { LANGUAGES } from "@/lib/constants/languages.ts";
-import type { ModelInfo } from "@/bindings";
+import type { ModelInfo, ProviderDescriptor } from "@/bindings";
 import { commands } from "@/bindings";
 import { Input } from "@/components/ui/Input";
 import { Button } from "@/components/ui/Button";
 import { Dropdown } from "@/components/ui";
+import { useTranscriptionProviderStore } from "@/stores/transcriptionProviderStore";
+import { CloudProviderBadge } from "./CloudProviderBadge";
+import { ProviderSetupDialog } from "./ProviderSetupDialog";
 
 // check if model supports a language based on its supported_languages list
 const modelSupportsLanguage = (model: ModelInfo, langCode: string): boolean => {
@@ -267,11 +270,26 @@ export const ModelsSettings: React.FC = () => {
   const [languageSearch, setLanguageSearch] = useState("");
   const [showGeminiKeyDialog, setShowGeminiKeyDialog] = useState(false);
   const [geminiKeyInput, setGeminiKeyInput] = useState("");
+  const [hasGeminiKey, setHasGeminiKey] = useState(false);
   const [showIfwDialog, setShowIfwDialog] = useState(false);
   const [ifwModelInput, setIfwModelInput] = useState("");
+  const [cloudProviderDialog, setCloudProviderDialog] =
+    useState<ProviderDescriptor | null>(null);
   const languageDropdownRef = useRef<HTMLDivElement>(null);
   const languageSearchInputRef = useRef<HTMLInputElement>(null);
-  const { getSetting, updateSetting } = useSettings();
+  const { getSetting } = useSettings();
+  const {
+    providers: cloudProviders,
+    selectedTarget,
+    credentialStatus,
+    consents,
+    initialize: initializeCloudProviders,
+    saveCredential,
+    deleteCredential,
+    acceptConsent,
+    revokeConsent,
+    selectTarget,
+  } = useTranscriptionProviderStore();
   const {
     models,
     currentModel,
@@ -285,6 +303,16 @@ export const ModelsSettings: React.FC = () => {
     selectModel,
     deleteModel,
   } = useModelStore();
+
+  useEffect(() => {
+    void initializeCloudProviders();
+  }, [initializeCloudProviders]);
+
+  useEffect(() => {
+    void commands.getProviderCredentialStatus("gemini").then((result) => {
+      if (result.status === "ok") setHasGeminiKey(result.data.configured);
+    });
+  }, []);
 
   // click outside handler for language dropdown
   useEffect(() => {
@@ -324,9 +352,6 @@ export const ModelsSettings: React.FC = () => {
     }
     return LANGUAGES.find((lang) => lang.value === languageFilter)?.label || "";
   }, [languageFilter, t]);
-
-  const geminiApiKey = getSetting("gemini_api_key") as string | undefined;
-  const hasGeminiKey = !!geminiApiKey && geminiApiKey.length > 0;
 
   const ifwModel = getSetting("insanely_fast_whisper_model") as
     | string
@@ -379,7 +404,9 @@ export const ModelsSettings: React.FC = () => {
     }
     setSwitchingModelId(modelId);
     try {
-      await selectModel(modelId);
+      const modelSelected = await selectModel(modelId);
+      if (!modelSelected) return;
+      await selectTarget({ provider_id: "local", model_id: modelId });
     } finally {
       setSwitchingModelId(null);
     }
@@ -388,11 +415,15 @@ export const ModelsSettings: React.FC = () => {
   const handleGeminiKeySave = async () => {
     const key = geminiKeyInput.trim();
     if (!key) return;
-    await updateSetting("gemini_api_key", key);
+    const result = await commands.changeGeminiApiKeySetting(key);
+    if (result.status !== "ok") return;
+    setHasGeminiKey(true);
     setShowGeminiKeyDialog(false);
     setSwitchingModelId("gemini-api");
     try {
-      await selectModel("gemini-api");
+      const modelSelected = await selectModel("gemini-api");
+      if (!modelSelected) return;
+      await selectTarget({ provider_id: "local", model_id: "gemini-api" });
     } finally {
       setSwitchingModelId(null);
     }
@@ -404,7 +435,12 @@ export const ModelsSettings: React.FC = () => {
     setShowIfwDialog(false);
     setSwitchingModelId("insanely-fast-whisper");
     try {
-      await selectModel("insanely-fast-whisper");
+      const modelSelected = await selectModel("insanely-fast-whisper");
+      if (!modelSelected) return;
+      await selectTarget({
+        provider_id: "local",
+        model_id: "insanely-fast-whisper",
+      });
     } finally {
       setSwitchingModelId(null);
     }
@@ -533,6 +569,69 @@ export const ModelsSettings: React.FC = () => {
 
       {activeTab === "transcription" && filteredModels.length > 0 ? (
         <div className="space-y-6">
+          {cloudProviders.length > 0 && (
+            <section
+              className="space-y-3"
+              aria-labelledby="cloud-providers-heading"
+            >
+              <div>
+                <h2
+                  id="cloud-providers-heading"
+                  className="text-sm font-medium text-text/60"
+                >
+                  {t("settings.models.cloud.title")}
+                </h2>
+                <p className="mt-1 text-xs text-text/50">
+                  {t("settings.models.cloud.description")}
+                </p>
+              </div>
+              {cloudProviders.map((provider) => {
+                const active = selectedTarget?.provider_id === provider.id;
+                const status = credentialStatus[provider.id];
+                return (
+                  <div
+                    key={provider.id}
+                    className={`flex items-center justify-between gap-4 rounded-xl border p-4 ${
+                      active
+                        ? "border-logo-primary bg-logo-primary/5"
+                        : "border-mid-gray/20 bg-mid-gray/5"
+                    }`}
+                    data-testid={`cloud-provider-${provider.id}`}
+                  >
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium">{provider.label}</span>
+                        <CloudProviderBadge beta={provider.beta} />
+                        {active ? (
+                          <span className="text-xs font-medium text-green-600">
+                            {t("settings.models.cloud.active")}
+                          </span>
+                        ) : null}
+                      </div>
+                      <p className="text-sm text-text/60">
+                        {provider.models.map((model) => model.label).join(", ")}
+                      </p>
+                      <p className="text-xs text-text/50">
+                        {status?.configured
+                          ? t("settings.models.cloud.credentialConfigured")
+                          : t("settings.models.cloud.credentialMissing")}
+                      </p>
+                    </div>
+                    <Button
+                      variant={active ? "secondary" : "primary"}
+                      size="sm"
+                      onClick={() => setCloudProviderDialog(provider)}
+                    >
+                      {active
+                        ? t("settings.models.cloud.manage")
+                        : t("settings.models.cloud.configureButton")}
+                    </Button>
+                  </div>
+                );
+              })}
+            </section>
+          )}
+
           {/* Downloaded Models Section — header always visible so filter stays accessible */}
           <div className="space-y-3">
             <div className="flex items-center justify-between">
@@ -676,6 +775,34 @@ export const ModelsSettings: React.FC = () => {
           {t("settings.models.noModelsMatch")}
         </div>
       ) : null}
+
+      <ProviderSetupDialog
+        open={cloudProviderDialog !== null}
+        provider={cloudProviderDialog}
+        credentialStatus={
+          cloudProviderDialog
+            ? credentialStatus[cloudProviderDialog.id]
+            : undefined
+        }
+        acceptedConsentVersion={
+          cloudProviderDialog ? (consents[cloudProviderDialog.id] ?? 0) : 0
+        }
+        onClose={() => setCloudProviderDialog(null)}
+        onSaveCredential={saveCredential}
+        onDeleteCredential={deleteCredential}
+        onAcceptConsent={acceptConsent}
+        onRevokeConsent={revokeConsent}
+        onSelectTarget={selectTarget}
+        onTestConnection={async (providerId) => {
+          try {
+            const result =
+              await commands.testCloudProviderConnection(providerId);
+            return result.status === "error" ? result.error : null;
+          } catch {
+            return "operationFailed";
+          }
+        }}
+      />
 
       {showGeminiKeyDialog && (
         <div

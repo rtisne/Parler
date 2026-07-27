@@ -32,6 +32,7 @@ pub const MODEL_SCRIBE_V2: &str = "scribe_v2";
 
 const DEFAULT_BASE_URL: &str = "https://api.elevenlabs.io";
 const ENDPOINT_PATH: &str = "/v1/speech-to-text";
+const CONNECTION_TEST_PATH: &str = "/v1/user";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// ElevenLabs Scribe v2 batch provider.
@@ -97,6 +98,9 @@ pub fn descriptor() -> ProviderDescriptor {
         privacy_url: Some("https://elevenlabs.io/privacy-policy".to_string()),
         pricing_url: Some("https://elevenlabs.io/pricing/api".to_string()),
         cost_text: Some("≈ $0.22 / hour of audio".to_string()),
+        retention_text: Some(
+            "Retention follows your ElevenLabs account and provider policy settings.".to_string(),
+        ),
         consent_version: 1,
         beta: true,
     }
@@ -129,6 +133,20 @@ fn encode_wav(samples: &[f32]) -> Result<Vec<u8>, TranscriptionError> {
             .map_err(|_| TranscriptionError::InvalidConfiguration("wav finalize".to_string()))?;
     }
     Ok(buffer)
+}
+
+fn valid_keyterms(custom_words: &[String]) -> impl Iterator<Item = String> + '_ {
+    custom_words
+        .iter()
+        .map(|term| term.trim())
+        .filter(|term| {
+            !term.is_empty()
+                && term.chars().count() < 50
+                && term.split_whitespace().count() <= 5
+                && !term.chars().any(|character| "<>{}[]\\".contains(character))
+        })
+        .take(1000)
+        .map(str::to_owned)
 }
 
 /// Map a non-2xx HTTP status to a normalized error category (ADR §2.4). The
@@ -188,9 +206,16 @@ impl TranscriptionProvider for ElevenLabsProvider {
 
     async fn transcribe(
         &self,
+        model_id: &str,
         request: &TranscriptionRequest,
         api_key: &str,
     ) -> Result<TranscriptionResult, TranscriptionError> {
+        if model_id != MODEL_SCRIBE_V2 {
+            return Err(TranscriptionError::InvalidConfiguration(
+                "unsupported ElevenLabs model".into(),
+            ));
+        }
+        let api_key = api_key.trim();
         if api_key.is_empty() {
             return Err(TranscriptionError::MissingCredential);
         }
@@ -209,17 +234,20 @@ impl TranscriptionProvider for ElevenLabsProvider {
             .map_err(|_| TranscriptionError::Protocol)?;
 
         let mut form = reqwest::multipart::Form::new()
-            .text("model_id", MODEL_SCRIBE_V2)
+            .text("model_id", model_id.to_string())
             .part("file", file_part);
 
         // Send an explicit language only when the user chose a concrete one;
-        // "auto" / None lets the provider auto-detect. Custom words are NOT sent
-        // as `keyterms` in milestone 1 (ADR Q4); local correction runs on the
-        // returned text instead.
+        // "auto" / None lets the provider auto-detect.
         if let Some(language) = request.language.as_ref() {
             if !language.is_empty() && language != "auto" {
                 form = form.text("language_code", language.clone());
             }
+        }
+        // OpenAPI multipart arrays use form/explode semantics: repeat the
+        // `keyterms` field once per valid custom term.
+        for keyterm in valid_keyterms(&request.custom_words) {
+            form = form.text("keyterms", keyterm);
         }
 
         let url = format!("{}{}", self.base_url, ENDPOINT_PATH);
@@ -238,8 +266,10 @@ impl TranscriptionProvider for ElevenLabsProvider {
 
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            // Drain the body for connection reuse but never log or surface it.
-            let _ = response.text().await;
+            // The body is never read: it's never logged or surfaced, and
+            // reading it would let a remote server force an unbounded
+            // allocation. Dropping `response` here closes the connection
+            // instead of reusing it, which is an acceptable trade-off.
             let err = map_status_error(status);
             warn!(
                 "elevenlabs batch failed: http {} -> {}",
@@ -267,6 +297,25 @@ impl TranscriptionProvider for ElevenLabsProvider {
             detected_language: parsed.detected_language,
             latency,
         })
+    }
+
+    async fn test_connection(&self, api_key: &str) -> Result<(), TranscriptionError> {
+        if api_key.trim().is_empty() {
+            return Err(TranscriptionError::MissingCredential);
+        }
+        let response = self
+            .http
+            .get(format!("{}{}", self.base_url, CONNECTION_TEST_PATH))
+            .header("xi-api-key", api_key.trim())
+            .send()
+            .await
+            .map_err(|error| classify_send_error(&error))?;
+        let status = response.status().as_u16();
+        if (200..300).contains(&status) {
+            Ok(())
+        } else {
+            Err(map_status_error(status))
+        }
     }
 }
 
@@ -311,18 +360,24 @@ mod tests {
 
     #[test]
     fn invalid_json_is_protocol_error() {
-        assert_eq!(
-            parse_transcript("not json").unwrap_err(),
-            TranscriptionError::Protocol
-        );
+        let error = parse_transcript("not json")
+            .err()
+            .expect("invalid JSON must fail");
+        assert_eq!(error, TranscriptionError::Protocol);
+    }
+
+    #[test]
+    fn empty_transcript_is_not_treated_as_a_protocol_error() {
+        let parsed = parse_transcript(r#"{"text":"   ","language_code":"fr"}"#).unwrap();
+        assert!(parsed.text.is_empty());
     }
 
     #[test]
     fn missing_text_field_is_protocol_error() {
-        assert_eq!(
-            parse_transcript(r#"{"language_code":"fr"}"#).unwrap_err(),
-            TranscriptionError::Protocol
-        );
+        let error = parse_transcript(r#"{"language_code":"fr"}"#)
+            .err()
+            .expect("a response without text must fail");
+        assert_eq!(error, TranscriptionError::Protocol);
     }
 
     #[test]
@@ -399,18 +454,44 @@ mod tests {
     fn empty_api_key_is_missing_credential_without_network() {
         let provider = ElevenLabsProvider::with_base_url("http://127.0.0.1:1");
         let err = runtime()
-            .block_on(provider.transcribe(&sample_request(), ""))
+            .block_on(provider.transcribe(MODEL_SCRIBE_V2, &sample_request(), ""))
             .unwrap_err();
         assert_eq!(err, TranscriptionError::MissingCredential);
+    }
+
+    #[test]
+    fn whitespace_only_api_key_is_missing_credential_without_network() {
+        let provider = ElevenLabsProvider::with_base_url("http://127.0.0.1:1");
+        let err = runtime()
+            .block_on(provider.transcribe(MODEL_SCRIBE_V2, &sample_request(), "   \t  "))
+            .unwrap_err();
+        assert_eq!(err, TranscriptionError::MissingCredential);
+    }
+
+    #[test]
+    fn connection_test_uses_user_endpoint_without_audio() {
+        let (base, captured) = spawn_mock(http_response("200 OK", "{}"), None);
+        let provider = ElevenLabsProvider::with_base_url(base);
+        runtime()
+            .block_on(provider.test_connection("test-key"))
+            .unwrap();
+
+        let request = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        assert!(request.starts_with("GET /v1/user "));
+        assert!(request.contains("test-key"));
+        assert!(!request.contains("audio.wav"));
+        assert!(!request.contains("RIFF"));
     }
 
     #[test]
     fn success_returns_text_and_sends_auth_header() {
         let (base, captured) = spawn_mock(http_response("200 OK", SUCCESS_FR), None);
         let provider = ElevenLabsProvider::with_base_url(base);
+        let mut request = sample_request();
+        request.custom_words = vec!["ParlerUniqueTerm".to_string()];
 
         let result = runtime()
-            .block_on(provider.transcribe(&sample_request(), "test-key"))
+            .block_on(provider.transcribe(MODEL_SCRIBE_V2, &request, "test-key"))
             .unwrap();
 
         assert_eq!(result.text, "Bonjour, ceci est une dictée de test.");
@@ -425,10 +506,80 @@ mod tests {
         );
         assert!(request.contains("test-key"), "auth header value missing");
         assert!(request.contains("model_id"), "model_id field missing");
+        assert!(request.contains("scribe_v2"), "model value missing");
+        assert!(
+            request.contains("language_code") && request.contains("fr"),
+            "explicit language missing"
+        );
+        assert!(
+            request
+                .contains("Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"")
+                || request.contains("filename=\"audio.wav\""),
+            "multipart file metadata missing"
+        );
+        assert!(
+            request.contains("Content-Type: audio/wav"),
+            "WAV MIME missing"
+        );
+        assert!(
+            request.contains("keyterms") && request.contains("ParlerUniqueTerm"),
+            "custom words must be sent as repeated keyterms fields"
+        );
+        let bytes = captured.lock().unwrap();
+        let wav_start = bytes
+            .windows(4)
+            .position(|window| window == b"RIFF")
+            .expect("multipart payload is not WAV");
+        let reader = hound::WavReader::new(Cursor::new(&bytes[wav_start..])).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, 16_000);
+        assert_eq!(spec.bits_per_sample, 16);
+        assert_eq!(spec.sample_format, hound::SampleFormat::Int);
         // The key must never appear anywhere but the auth header value; it does
         // here because we sent it, which is expected. Confirm it is not echoed
         // into any result field.
         assert!(!result.text.contains("test-key"));
+    }
+
+    #[test]
+    fn api_key_with_surrounding_whitespace_is_sent_trimmed() {
+        let (base, captured) = spawn_mock(http_response("200 OK", SUCCESS_FR), None);
+        let provider = ElevenLabsProvider::with_base_url(base);
+        runtime()
+            .block_on(provider.transcribe(MODEL_SCRIBE_V2, &sample_request(), "  test-key  "))
+            .unwrap();
+        let request = String::from_utf8_lossy(&captured.lock().unwrap()).to_string();
+        let header_line = request
+            .lines()
+            .find(|line| line.to_lowercase().starts_with("xi-api-key"))
+            .expect("api key header missing");
+        assert_eq!(header_line.trim(), "xi-api-key: test-key");
+    }
+
+    #[test]
+    fn invalid_json_from_http_is_protocol_error() {
+        let (base, _) = spawn_mock(http_response("200 OK", "not-json"), None);
+        let provider = ElevenLabsProvider::with_base_url(base);
+        let err = runtime()
+            .block_on(provider.transcribe(MODEL_SCRIBE_V2, &sample_request(), "test-key"))
+            .unwrap_err();
+        assert_eq!(err, TranscriptionError::Protocol);
+    }
+
+    #[test]
+    fn unsupported_keyterms_are_filtered_before_multipart_encoding() {
+        let terms = vec![
+            " valid term ".to_string(),
+            "contains [ bracket".to_string(),
+            "one two three four five six".to_string(),
+            "x".repeat(50),
+            String::new(),
+        ];
+        assert_eq!(
+            valid_keyterms(&terms).collect::<Vec<_>>(),
+            vec!["valid term"]
+        );
     }
 
     #[test]
@@ -442,7 +593,7 @@ mod tests {
         );
         let provider = ElevenLabsProvider::with_base_url(base);
         let err = runtime()
-            .block_on(provider.transcribe(&sample_request(), "bad-key"))
+            .block_on(provider.transcribe(MODEL_SCRIBE_V2, &sample_request(), "bad-key"))
             .unwrap_err();
         assert_eq!(err, TranscriptionError::Authentication);
     }
@@ -458,7 +609,7 @@ mod tests {
         );
         let provider = ElevenLabsProvider::with_base_url(base);
         let err = runtime()
-            .block_on(provider.transcribe(&sample_request(), "k"))
+            .block_on(provider.transcribe(MODEL_SCRIBE_V2, &sample_request(), "k"))
             .unwrap_err();
         assert_eq!(err, TranscriptionError::RateLimited);
     }
@@ -468,7 +619,7 @@ mod tests {
         let (base, _) = spawn_mock(http_response("503 Service Unavailable", "{}"), None);
         let provider = ElevenLabsProvider::with_base_url(base);
         let err = runtime()
-            .block_on(provider.transcribe(&sample_request(), "k"))
+            .block_on(provider.transcribe(MODEL_SCRIBE_V2, &sample_request(), "k"))
             .unwrap_err();
         assert_eq!(err, TranscriptionError::ProviderUnavailable);
     }
@@ -482,8 +633,72 @@ mod tests {
         let provider =
             ElevenLabsProvider::with_base_url_and_timeout(base, Duration::from_millis(120));
         let err = runtime()
-            .block_on(provider.transcribe(&sample_request(), "k"))
+            .block_on(provider.transcribe(MODEL_SCRIBE_V2, &sample_request(), "k"))
             .unwrap_err();
         assert_eq!(err, TranscriptionError::Timeout);
+    }
+
+    /// Send headers for a non-2xx status with a large declared `Content-Length`
+    /// but never actually send the body, holding the connection open for
+    /// `hold_open`. If the client ever tried to read the body it would block
+    /// for the full `hold_open` duration; a bounded `tokio::time::timeout`
+    /// around the call proves it doesn't.
+    fn spawn_mock_undelivered_body(status_line: &str, hold_open: Duration) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
+                let mut buf = [0u8; 4096];
+                loop {
+                    match socket.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                let header = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: 10485760\r\n\r\n",
+                    status_line
+                );
+                let _ = socket.write_all(header.as_bytes());
+                let _ = socket.flush();
+                std::thread::sleep(hold_open);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn error_with_undelivered_body_does_not_block_transcribe() {
+        let base =
+            spawn_mock_undelivered_body("500 Internal Server Error", Duration::from_millis(500));
+        let provider = ElevenLabsProvider::with_base_url(base);
+        let outcome = runtime().block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                provider.transcribe(MODEL_SCRIBE_V2, &sample_request(), "k"),
+            )
+            .await
+        });
+        let err = outcome
+            .expect("must not block waiting on an undelivered error body")
+            .unwrap_err();
+        assert_eq!(err, TranscriptionError::ProviderUnavailable);
+    }
+
+    #[test]
+    fn error_with_undelivered_body_does_not_block_test_connection() {
+        let base =
+            spawn_mock_undelivered_body("500 Internal Server Error", Duration::from_millis(500));
+        let provider = ElevenLabsProvider::with_base_url(base);
+        let outcome = runtime().block_on(async {
+            tokio::time::timeout(Duration::from_millis(200), provider.test_connection("k")).await
+        });
+        let err = outcome
+            .expect("must not block waiting on an undelivered error body")
+            .unwrap_err();
+        assert_eq!(err, TranscriptionError::ProviderUnavailable);
     }
 }

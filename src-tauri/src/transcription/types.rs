@@ -78,6 +78,8 @@ pub struct ProviderDescriptor {
     pub pricing_url: Option<String>,
     /// Short, human-readable cost hint (e.g. "≈ $0.22 / hour of audio").
     pub cost_text: Option<String>,
+    /// Human-readable provider retention behavior shown before activation.
+    pub retention_text: Option<String>,
     /// Version of the consent text the user must accept. Bumping this
     /// invalidates prior consent for the provider.
     pub consent_version: u32,
@@ -255,6 +257,7 @@ mod tests {
             privacy_url: Some("https://elevenlabs.io/privacy-policy".into()),
             pricing_url: Some("https://elevenlabs.io/pricing/api".into()),
             cost_text: Some("≈ $0.22 / hour".into()),
+            retention_text: Some("Provider policy applies".into()),
             consent_version: 1,
             beta: true,
         };

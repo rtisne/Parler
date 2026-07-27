@@ -19,6 +19,7 @@ use specta::Type;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_autostart::ManagerExt;
 
+use crate::secrets::{migration::POST_PROCESS_ACCOUNT_PREFIX, SecretStoreError, SharedSecretStore};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::settings::APPLE_INTELLIGENCE_DEFAULT_MODEL_ID;
 use crate::settings::{
@@ -954,7 +955,21 @@ pub fn change_post_process_api_key_setting(
 ) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
     validate_provider_exists(&settings, &provider_id)?;
-    settings.post_process_api_keys.insert(provider_id, api_key);
+    let store = app.state::<SharedSecretStore>();
+    let account = format!("{POST_PROCESS_ACCOUNT_PREFIX}{provider_id}");
+    if api_key.trim().is_empty() {
+        store
+            .delete_secret(&account)
+            .map_err(|err| err.to_string())?;
+    } else {
+        store
+            .set_secret(&account, api_key.trim())
+            .map_err(|err| err.to_string())?;
+    }
+    // Clear the legacy plaintext slot only after the keyring operation succeeds.
+    settings
+        .post_process_api_keys
+        .insert(provider_id, String::new());
     settings::write_settings(&app, settings);
     Ok(())
 }
@@ -1187,6 +1202,14 @@ pub fn delete_saved_processing_model(app: AppHandle, id: String) -> Result<(), S
     Ok(())
 }
 
+/// Normalize a credential read from the store immediately before it reaches
+/// any network call. `set_secret` trims on write, but a value stored before
+/// that guard existed (a legacy/pre-fix entry) could still carry
+/// surrounding whitespace, and a network client must never receive that.
+fn normalize_fetched_api_key(raw: String) -> String {
+    raw.trim().to_string()
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn fetch_post_process_models(
@@ -1215,14 +1238,25 @@ pub async fn fetch_post_process_models(
     }
 
     // Get API key
-    let api_key = settings
-        .post_process_api_keys
-        .get(&provider_id)
-        .cloned()
-        .unwrap_or_default();
+    let store = app.state::<SharedSecretStore>();
+    let api_key = match store.get_secret(&format!("{POST_PROCESS_ACCOUNT_PREFIX}{provider_id}")) {
+        Ok(key) => key,
+        Err(SecretStoreError::NotFound) if provider.id == "custom" => String::new(),
+        Err(SecretStoreError::NotFound) => {
+            return Err("API key is required to list remote models.".to_string());
+        }
+        Err(_) => {
+            return Err("Credential storage is unavailable; no remote request was sent.".into());
+        }
+    };
+    // Normalize at this network-request boundary regardless of what the
+    // store returned: a value written before `set_secret` started trimming
+    // (a legacy/pre-fix entry) could still carry surrounding whitespace, and
+    // that must never reach the outgoing request headers untrimmed.
+    let api_key = normalize_fetched_api_key(api_key);
 
     // Skip fetching if no API key for providers that typically need one
-    if api_key.trim().is_empty() && provider.id != "custom" {
+    if api_key.is_empty() && provider.id != "custom" {
         return Err(format!(
             "API key is required for {}. Please add an API key to list available models.",
             provider.label
@@ -1301,7 +1335,10 @@ pub fn change_long_audio_model_setting(
     model_id: Option<String>,
 ) -> Result<(), String> {
     let mut settings = settings::get_settings(&app);
-    settings.long_audio_model = model_id;
+    settings.long_audio_model = model_id.clone();
+    settings.long_audio_target = model_id
+        .as_deref()
+        .map(|id| crate::transcription::TranscriptionTargetId::new("local", id));
     settings::write_settings(&app, settings);
     Ok(())
 }
@@ -1339,4 +1376,30 @@ pub fn change_preload_model_setting(app: AppHandle, enabled: bool) -> Result<(),
     settings.preload_model_on_startup = enabled;
     settings::write_settings(&app, settings);
     Ok(())
+}
+
+#[cfg(test)]
+mod fetch_post_process_models_tests {
+    use super::normalize_fetched_api_key;
+
+    #[test]
+    fn trims_surrounding_whitespace_from_a_legacy_stored_key() {
+        assert_eq!(
+            normalize_fetched_api_key("  sk-legacy-key  \t".to_string()),
+            "sk-legacy-key"
+        );
+    }
+
+    #[test]
+    fn leaves_an_already_trimmed_key_unchanged() {
+        assert_eq!(normalize_fetched_api_key("sk-abc".to_string()), "sk-abc");
+    }
+
+    #[test]
+    fn whitespace_only_key_normalizes_to_empty() {
+        // The caller's own `is_empty()` check (after normalization) is what
+        // then rejects this -- confirms normalization runs before that check
+        // could ever be fooled by whitespace padding.
+        assert_eq!(normalize_fetched_api_key("   ".to_string()), "");
+    }
 }

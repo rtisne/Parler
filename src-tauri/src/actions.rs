@@ -1,11 +1,16 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::apple_intelligence;
 use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
+use crate::audio_toolkit::{apply_custom_words, filter_transcription_output};
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
-use crate::managers::transcription::TranscriptionManager;
+use crate::managers::transcription::{
+    RestoreOutcome, RestoreTicket, TicketGuard, TranscriptionManager,
+};
+use crate::secrets::{migration::POST_PROCESS_ACCOUNT_PREFIX, SharedSecretStore};
 use crate::settings::{get_settings, AppSettings, APPLE_INTELLIGENCE_PROVIDER_ID};
 use crate::shortcut;
+use crate::transcription::{TranscriptionRequest, TranscriptionService};
 use crate::tray::{change_tray_icon, TrayIconState};
 use crate::utils::{
     self, show_processing_overlay, show_recording_overlay, show_transcribing_overlay,
@@ -17,8 +22,8 @@ use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tauri::AppHandle;
 use tauri::Manager;
+use tauri::{AppHandle, Emitter};
 
 pub struct ActiveActionState(pub Mutex<Option<u8>>);
 
@@ -58,7 +63,19 @@ fn build_system_prompt(prompt_template: &str) -> String {
     prompt_template.replace("${output}", "").trim().to_string()
 }
 
-async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
+fn post_process_api_key(
+    app: &AppHandle,
+    provider_id: &str,
+) -> Result<String, crate::secrets::SecretStoreError> {
+    let store = app.state::<SharedSecretStore>();
+    store.get_secret(&format!("{POST_PROCESS_ACCOUNT_PREFIX}{provider_id}"))
+}
+
+async fn post_process_transcription(
+    app: &AppHandle,
+    settings: &AppSettings,
+    transcription: &str,
+) -> Option<String> {
     let provider = match settings.active_post_process_provider().cloned() {
         Some(provider) => provider,
         None => {
@@ -114,11 +131,17 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
         provider.id, model
     );
 
-    let api_key = settings
-        .post_process_api_keys
-        .get(&provider.id)
-        .cloned()
-        .unwrap_or_default();
+    let api_key = if provider.id == APPLE_INTELLIGENCE_PROVIDER_ID {
+        String::new()
+    } else {
+        match post_process_api_key(app, &provider.id) {
+            Ok(key) if !key.trim().is_empty() => key.trim().to_string(),
+            Ok(_) | Err(_) => {
+                warn!("Post-processing skipped because the provider credential is unavailable");
+                return None;
+            }
+        }
+    };
 
     if provider.supports_structured_output {
         debug!("Using structured outputs for provider '{}'", provider.id);
@@ -267,6 +290,7 @@ async fn post_process_transcription(settings: &AppSettings, transcription: &str)
 }
 
 async fn process_action(
+    app: &AppHandle,
     settings: &AppSettings,
     transcription: &str,
     prompt: &str,
@@ -361,11 +385,17 @@ async fn process_action(
         return None;
     }
 
-    let api_key = settings
-        .post_process_api_keys
-        .get(&provider.id)
-        .cloned()
-        .unwrap_or_default();
+    let api_key = if provider.id == APPLE_INTELLIGENCE_PROVIDER_ID {
+        String::new()
+    } else {
+        match post_process_api_key(app, &provider.id) {
+            Ok(key) if !key.trim().is_empty() => key.trim().to_string(),
+            Ok(_) | Err(_) => {
+                warn!("Post-processing skipped because the provider credential is unavailable");
+                return None;
+            }
+        }
+    };
 
     let system_prompt = "You are a text processing assistant. Output ONLY the final processed text. Do not add any explanation, commentary, preamble, or formatting such as markdown code blocks. Just output the raw result text, nothing else.".to_string();
 
@@ -529,6 +559,7 @@ impl ShortcutAction for TranscribeAction {
         let ah = app.clone();
         let rm = Arc::clone(&app.state::<Arc<AudioRecordingManager>>());
         let tm = Arc::clone(&app.state::<Arc<TranscriptionManager>>());
+        let transcription_service = Arc::clone(&app.state::<Arc<TranscriptionService>>());
         let hm = Arc::clone(&app.state::<Arc<HistoryManager>>());
 
         change_tray_icon(app, TrayIconState::Transcribing);
@@ -572,10 +603,21 @@ impl ShortcutAction for TranscribeAction {
 
                 let duration_seconds = samples.len() as f32 / 16000.0;
                 let settings_for_model = get_settings(&ah);
+                let mut effective_target = settings_for_model.selected_transcription_target.clone();
                 let original_model = tm.get_current_model();
                 let mut switched_model = false;
+                // The restore ticket opened atomically with this function's
+                // own local model switch, if any. It captures whatever was
+                // loaded *before* that switch (including "nothing") as the
+                // baseline to restore later, and the restore below blocks
+                // for its correct turn against any other concurrent
+                // temporary switch while still never clobbering a genuinely
+                // newer explicit selection (`set_active_model`) that landed
+                // in the meantime -- see `RestoreTicket`'s docs.
+                let mut switch_ticket: Option<RestoreTicket> = None;
 
-                if let Some(ref long_model_id) = settings_for_model.long_audio_model {
+                if let Some(long_target) = settings_for_model.long_audio_fallback_target() {
+                    let long_model_id = &long_target.model_id;
                     if duration_seconds > settings_for_model.long_audio_threshold_seconds
                         && original_model.as_deref() != Some(long_model_id.as_str())
                     {
@@ -585,31 +627,96 @@ impl ShortcutAction for TranscribeAction {
                             settings_for_model.long_audio_threshold_seconds,
                             long_model_id
                         );
-                        if let Err(e) = tm.load_model(long_model_id) {
-                            warn!(
-                                "Failed to load long audio model '{}': {}, using current model",
-                                long_model_id, e
-                            );
-                        } else {
-                            switched_model = true;
+                        match tm.begin_temporary_local_switch(long_model_id) {
+                            Err(e) => {
+                                warn!(
+                                    "Failed to load long audio model '{}': {}, using current model",
+                                    long_model_id, e
+                                );
+                            }
+                            Ok(ticket) => {
+                                switched_model = true;
+                                effective_target = Some(long_target.clone());
+                                switch_ticket = Some(ticket);
+                            }
                         }
                     }
                 }
 
                 let transcription_time = Instant::now();
                 let samples_clone = samples.clone(); // Clone for history saving
-                match tm.transcribe(samples) {
+                let selected_target = effective_target;
+                let cloud_target = selected_target
+                    .as_ref()
+                    .filter(|target| target.provider_id != "local");
+
+                let model_name_for_history = cloud_target
+                    .map(|target| format!("{}/{}", target.provider_id, target.model_id))
+                    .or_else(|| tm.get_current_model_name());
+
+                let transcription_result = if let Some(target) = selected_target.as_ref() {
+                    let accepted_consent_version = if target.provider_id == "local" {
+                        0
+                    } else {
+                        settings_for_model
+                            .cloud_provider_consents
+                            .get(&target.provider_id)
+                            .copied()
+                            .unwrap_or(0)
+                    };
+                    let language = match settings_for_model.selected_language.as_str() {
+                        "auto" => None,
+                        "zh-Hans" | "zh-Hant" => Some("zh".to_string()),
+                        language => Some(language.to_string()),
+                    };
+                    let request = TranscriptionRequest {
+                        audio_16khz_mono: samples,
+                        language,
+                        custom_words: settings_for_model.custom_words.clone(),
+                    };
+                    transcription_service
+                        .transcribe_batch(target, accepted_consent_version, &request)
+                        .await
+                        .map(|result| {
+                            if target.provider_id == "local" {
+                                result.text
+                            } else {
+                                let corrected = if settings_for_model.custom_words.is_empty() {
+                                    result.text
+                                } else {
+                                    apply_custom_words(
+                                        &result.text,
+                                        &settings_for_model.custom_words,
+                                        settings_for_model.word_correction_threshold,
+                                    )
+                                };
+                                filter_transcription_output(&corrected)
+                            }
+                        })
+                        .map_err(|error| anyhow::anyhow!(error.category()))
+                } else {
+                    Err(anyhow::anyhow!("no_transcription_target"))
+                };
+
+                match transcription_result {
                     Ok(transcription) => {
                         let mut transcription = transcription;
                         debug!(
-                            "Transcription completed in {:?}: '{}'",
+                            "Transcription completed in {:?} ({} characters)",
                             transcription_time.elapsed(),
-                            transcription
+                            transcription.chars().count()
                         );
 
                         // Fallback: if cheap model returned nothing on meaningful audio, retry with accurate model
-                        if transcription.is_empty() && duration_seconds > 1.0 && !switched_model {
-                            if let Some(ref long_model_id) = settings_for_model.long_audio_model {
+                        if cloud_target.is_none()
+                            && transcription.is_empty()
+                            && duration_seconds > 1.0
+                            && !switched_model
+                        {
+                            if let Some(long_target) =
+                                settings_for_model.long_audio_fallback_target()
+                            {
+                                let long_model_id = &long_target.model_id;
                                 let already_using_long =
                                     original_model.as_deref() == Some(long_model_id.as_str());
                                 if !already_using_long {
@@ -617,23 +724,44 @@ impl ShortcutAction for TranscribeAction {
                                         "Transcription empty for {:.1}s audio, retrying with long audio model: {}",
                                         duration_seconds, long_model_id
                                     );
-                                    match tm.load_model(long_model_id) {
-                                        Ok(()) => {
+                                    match tm.begin_temporary_local_switch(long_model_id) {
+                                        Ok(ticket) => {
                                             switched_model = true;
-                                            match tm.transcribe(samples_clone.clone()) {
+                                            switch_ticket = Some(ticket);
+                                            let retry_request = TranscriptionRequest {
+                                                audio_16khz_mono: samples_clone.clone(),
+                                                language: match settings_for_model
+                                                    .selected_language
+                                                    .as_str()
+                                                {
+                                                    "auto" => None,
+                                                    "zh-Hans" | "zh-Hant" => Some("zh".to_string()),
+                                                    language => Some(language.to_string()),
+                                                },
+                                                custom_words: settings_for_model
+                                                    .custom_words
+                                                    .clone(),
+                                            };
+                                            match transcription_service
+                                                .transcribe_batch(&long_target, 0, &retry_request)
+                                                .await
+                                            {
                                                 Ok(retry_result) => {
-                                                    if !retry_result.is_empty() {
+                                                    if !retry_result.text.is_empty() {
                                                         debug!(
-                                                            "Fallback transcription succeeded: '{}'",
-                                                            retry_result
+                                                            "Fallback transcription succeeded ({} characters)",
+                                                            retry_result.text.chars().count()
                                                         );
-                                                        transcription = retry_result;
+                                                        transcription = retry_result.text;
                                                     } else {
                                                         debug!("Fallback transcription also returned empty");
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    warn!("Fallback transcription error: {}", e);
+                                                    warn!(
+                                                        "Fallback transcription error: {}",
+                                                        e.category()
+                                                    );
                                                 }
                                             }
                                         }
@@ -677,6 +805,7 @@ impl ShortcutAction for TranscribeAction {
                             // Action processing takes priority over default post-processing
                             let processed = if let Some(ref action) = selected_action {
                                 process_action(
+                                    &ah,
                                     &settings,
                                     &final_text,
                                     &action.prompt,
@@ -685,7 +814,7 @@ impl ShortcutAction for TranscribeAction {
                                 )
                                 .await
                             } else if post_process {
-                                post_process_transcription(&settings, &final_text).await
+                                post_process_transcription(&ah, &settings, &final_text).await
                             } else {
                                 None
                             };
@@ -741,7 +870,7 @@ impl ShortcutAction for TranscribeAction {
                         if !transcription.is_empty() || duration_seconds > 1.0 {
                             let hm_clone = Arc::clone(&hm);
                             let transcription_for_history = transcription.clone();
-                            let model_name_for_history = tm.get_current_model_name();
+                            let history_entry_model_name = model_name_for_history.clone();
                             let action_key_for_history = if post_processed_text.is_some() {
                                 selected_action_key
                             } else {
@@ -755,7 +884,7 @@ impl ShortcutAction for TranscribeAction {
                                         post_processed_text,
                                         post_process_prompt,
                                         action_key_for_history,
-                                        model_name_for_history,
+                                        history_entry_model_name,
                                     )
                                     .await
                                 {
@@ -765,18 +894,77 @@ impl ShortcutAction for TranscribeAction {
                         }
                     }
                     Err(err) => {
-                        debug!("Global Shortcut Transcription error: {}", err);
+                        if cloud_target.is_some() {
+                            warn!("Cloud transcription failed; preserving audio without paste");
+                            // Never paste or silently retry with a local engine. Persist
+                            // even sub-second recordings before leaving the error path so
+                            // manual retry always has an audio source.
+                            let saved_for_retry = match hm
+                                .save_transcription(
+                                    samples_clone,
+                                    String::new(),
+                                    None,
+                                    None,
+                                    None,
+                                    model_name_for_history.clone(),
+                                )
+                                .await
+                            {
+                                Ok(_) => true,
+                                Err(history_error) => {
+                                    error!(
+                                        "Failed to preserve failed cloud recording: {}",
+                                        history_error
+                                    );
+                                    false
+                                }
+                            };
+                            let _ = ah.emit(
+                                "cloud-transcription-failed",
+                                serde_json::json!({
+                                    "category": err.to_string(),
+                                    "saved_for_retry": saved_for_retry,
+                                }),
+                            );
+                        } else {
+                            debug!("Global Shortcut Transcription error: {}", err);
+                        }
                         utils::hide_recording_overlay(&ah);
                         change_tray_icon(&ah, TrayIconState::Idle);
                     }
                 }
 
-                // Restore original model if we switched for long audio
+                // Restore whatever was loaded before this function's own
+                // switch. The ticket carries its own baseline (which may be
+                // "nothing was loaded", not just some other model id), so
+                // this always attempts the correct restore regardless of the
+                // unload-timeout setting: if that setting caused an
+                // immediate auto-unload during transcription, the ticket
+                // simply comes back `Superseded` (a real, explicit slot
+                // change happened after it was opened) rather than
+                // incorrectly reloading something.
                 if switched_model {
-                    if let Some(ref orig_id) = original_model {
-                        debug!("Restoring original model: {}", orig_id);
-                        if let Err(e) = tm.load_model(orig_id) {
-                            warn!("Failed to restore original model '{}': {}", orig_id, e);
+                    if let Some(ticket) = switch_ticket.take() {
+                        let mut guard = TicketGuard::new(tm.as_ref().clone(), ticket);
+                        match guard.resolve() {
+                            RestoreOutcome::Restored | RestoreOutcome::Superseded => {}
+                            RestoreOutcome::Failed(e) => {
+                                error!(
+                                    "Failed to restore the local model state after a long-audio \
+                                     fallback switch: {}. The local model state may now be \
+                                     inconsistent with the user's selection.",
+                                    e
+                                );
+                                let _ = ah.emit(
+                                    "model-state-changed",
+                                    crate::managers::transcription::ModelStateEvent {
+                                        event_type: "restore_failed".to_string(),
+                                        model_id: None,
+                                        model_name: None,
+                                        error: Some(e),
+                                    },
+                                );
+                            }
                         }
                     }
                 }

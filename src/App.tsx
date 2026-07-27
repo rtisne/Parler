@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from "react";
-import { Toaster } from "sonner";
+import { toast, Toaster } from "sonner";
 import { useTranslation } from "react-i18next";
 import { platform } from "@tauri-apps/plugin-os";
 import { getIdentifier } from "@tauri-apps/api/app";
@@ -27,7 +27,7 @@ const renderSettingsContent = (section: SidebarSection) => {
 };
 
 function App() {
-  const { i18n } = useTranslation();
+  const { i18n, t } = useTranslation();
   const [onboardingStep, setOnboardingStep] = useState<OnboardingStep | null>(
     null,
   );
@@ -107,6 +107,24 @@ function App() {
       unlisten.then((fn) => fn());
     };
   }, []);
+
+  useEffect(() => {
+    const unlisten = listen<{ saved_for_retry: boolean }>(
+      "cloud-transcription-failed",
+      (event) => {
+        toast.error(
+          t(
+            event.payload.saved_for_retry
+              ? "settings.history.cloudFailedSaved"
+              : "settings.history.cloudFailedUnsaved",
+          ),
+        );
+      },
+    );
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [t]);
 
   const checkOnboardingStatus = async () => {
     try {

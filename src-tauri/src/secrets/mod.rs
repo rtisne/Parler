@@ -48,6 +48,21 @@ pub fn provider_account(provider_id: &str) -> Result<String, SecretStoreError> {
     Ok(format!("provider/{provider_id}/api-key"))
 }
 
+/// Normalize a secret before it is persisted: trim surrounding whitespace and
+/// reject a value that is empty or blank once trimmed.
+///
+/// Every [`SecretStore::set_secret`] implementation must route through this so
+/// no backend can ever persist a whitespace-only credential, regardless of
+/// which caller (a Tauri command, a legacy-settings migration, ...) supplied
+/// the raw value.
+pub(crate) fn normalize_secret(secret: &str) -> Result<String, SecretStoreError> {
+    let trimmed = secret.trim();
+    if trimmed.is_empty() {
+        return Err(SecretStoreError::InvalidSecret);
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Errors returned by a [`SecretStore`].
 ///
 /// None of these variants ever carries the secret value itself, so they are
@@ -108,9 +123,13 @@ pub trait SecretStore: Send + Sync {
     ///
     /// Returns `Ok(false)` when no secret is stored and `Err(..)` only when the
     /// backend itself fails, so callers can distinguish "absent" from "broken".
+    /// A stored value that is empty or blank once trimmed is treated as
+    /// unconfigured: `set_secret` rejects such values going forward, but this
+    /// keeps the check fail-closed for any value written before that guard
+    /// existed (e.g. through a legacy migration path).
     fn is_configured(&self, provider_id: &str) -> Result<bool, SecretStoreError> {
         match self.get_secret(provider_id) {
-            Ok(_) => Ok(true),
+            Ok(secret) => Ok(!secret.trim().is_empty()),
             Err(SecretStoreError::NotFound) => Ok(false),
             Err(e) => Err(e),
         }
@@ -240,6 +259,35 @@ mod tests {
     fn is_configured_propagates_backend_error() {
         let store = MemorySecretStore::failing();
         assert!(store.is_configured("p").is_err());
+    }
+
+    #[test]
+    fn set_secret_rejects_blank_and_whitespace_only_values() {
+        let store = MemorySecretStore::new();
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(
+                store.set_secret("p", blank),
+                Err(SecretStoreError::InvalidSecret)
+            );
+        }
+        assert_eq!(store.get_secret("p"), Err(SecretStoreError::NotFound));
+    }
+
+    #[test]
+    fn set_secret_stores_the_trimmed_value() {
+        let store = MemorySecretStore::new();
+        store.set_secret("p", "  sk-abc  ").unwrap();
+        assert_eq!(store.get_secret("p").unwrap(), "sk-abc");
+    }
+
+    #[test]
+    fn is_configured_is_false_for_a_legacy_blank_stored_value() {
+        // Simulates a value written before `set_secret` normalized/rejected
+        // blanks (e.g. a pre-fix migration). `is_configured` must still be
+        // fail-closed for it.
+        let store = MemorySecretStore::new();
+        store.seed_raw("p", "   ");
+        assert!(!store.is_configured("p").unwrap());
     }
 
     #[test]

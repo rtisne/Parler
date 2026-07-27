@@ -1,8 +1,62 @@
 use crate::managers::model::{EngineType, ModelInfo, ModelManager};
 use crate::managers::transcription::TranscriptionManager;
 use crate::settings::{get_settings, write_settings};
+use crate::transcription::{
+    ProviderCapabilities, ProviderDescriptor, ProviderKind, TranscriptionModelDescriptor,
+    TranscriptionRegistry, TranscriptionTargetId,
+};
 use std::sync::Arc;
 use tauri::{AppHandle, State};
+
+/// Unified target catalog for the UI: ModelManager contributes only local
+/// artifacts and the registry contributes cloud providers.
+#[tauri::command]
+#[specta::specta]
+pub async fn get_transcription_targets(
+    model_manager: State<'_, Arc<ModelManager>>,
+    registry: State<'_, Arc<TranscriptionRegistry>>,
+) -> Result<Vec<ProviderDescriptor>, String> {
+    let mut cloud = registry.descriptors();
+    cloud.retain(|provider| provider.id != "local");
+    cloud.sort_by(|left, right| left.label.cmp(&right.label));
+
+    let mut targets = Vec::with_capacity(cloud.len() + 1);
+    targets.push(local_descriptor(&model_manager));
+    targets.extend(cloud);
+    Ok(targets)
+}
+
+fn local_descriptor(model_manager: &ModelManager) -> ProviderDescriptor {
+    let models = model_manager
+        .get_available_models()
+        .into_iter()
+        .filter(|model| !matches!(model.engine_type, EngineType::InsanelyFastWhisper))
+        .map(|model| TranscriptionModelDescriptor {
+            id: model.id,
+            label: model.name,
+        })
+        .collect();
+    ProviderDescriptor {
+        id: "local".into(),
+        label: "Local".into(),
+        kind: ProviderKind::Local,
+        models,
+        capabilities: ProviderCapabilities {
+            batch: true,
+            realtime: false,
+            supported_languages: Vec::new(),
+            supports_word_timestamps: false,
+            sends_audio_off_device: false,
+        },
+        requires_credential: false,
+        privacy_url: None,
+        pricing_url: None,
+        cost_text: None,
+        retention_text: None,
+        consent_version: 0,
+        beta: false,
+    }
+}
 
 #[tauri::command]
 #[specta::specta]
@@ -50,6 +104,13 @@ pub async fn delete_model(
 
         let mut settings = get_settings(&app_handle);
         settings.selected_model = String::new();
+        if settings
+            .selected_transcription_target
+            .as_ref()
+            .is_some_and(|target| target.provider_id == "local" && target.model_id == model_id)
+        {
+            settings.selected_transcription_target = None;
+        }
         write_settings(&app_handle, settings);
     }
 
@@ -83,6 +144,7 @@ pub async fn set_active_model(
     // Update settings
     let mut settings = get_settings(&app_handle);
     settings.selected_model = model_id.clone();
+    settings.selected_transcription_target = Some(TranscriptionTargetId::new("local", model_id));
     write_settings(&app_handle, settings);
 
     Ok(())
@@ -119,13 +181,9 @@ pub async fn has_any_models_available(
     model_manager: State<'_, Arc<ModelManager>>,
 ) -> Result<bool, String> {
     let models = model_manager.get_available_models();
-    Ok(models.iter().any(|m| {
-        m.is_downloaded
-            && !matches!(
-                m.engine_type,
-                EngineType::GeminiApi | EngineType::InsanelyFastWhisper
-            )
-    }))
+    Ok(models
+        .iter()
+        .any(|m| m.is_downloaded && !matches!(m.engine_type, EngineType::InsanelyFastWhisper)))
 }
 
 #[tauri::command]
@@ -135,10 +193,8 @@ pub async fn has_any_models_or_downloads(
 ) -> Result<bool, String> {
     let models = model_manager.get_available_models();
     Ok(models.iter().any(|m| {
-        !matches!(
-            m.engine_type,
-            EngineType::GeminiApi | EngineType::InsanelyFastWhisper
-        ) && (m.is_downloaded || m.is_downloading)
+        !matches!(m.engine_type, EngineType::InsanelyFastWhisper)
+            && (m.is_downloaded || m.is_downloading)
     }))
 }
 
