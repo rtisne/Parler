@@ -384,6 +384,10 @@ pub struct AppSettings {
     pub external_script_path: Option<String>,
     #[serde(default)]
     pub long_audio_model: Option<String>,
+    /// Explicit long-recording target. Automatic fallback is deliberately
+    /// limited to local -> local; cloud targets are never retried implicitly.
+    #[serde(default)]
+    pub long_audio_target: Option<crate::transcription::types::TranscriptionTargetId>,
     #[serde(default = "default_long_audio_threshold_seconds")]
     pub long_audio_threshold_seconds: f32,
     #[serde(default)]
@@ -400,6 +404,22 @@ pub struct AppSettings {
     pub cpu_threads: usize,
     #[serde(default = "default_preload_model")]
     pub preload_model_on_startup: bool,
+    /// Explicitly selected transcription target (local or cloud). `None` means
+    /// the legacy local `selected_model` is used. Never carries a secret.
+    #[serde(default)]
+    pub selected_transcription_target: Option<crate::transcription::types::TranscriptionTargetId>,
+    /// One-time legacy target migration marker. This distinguishes an old file
+    /// with no target field from a user intentionally clearing the active target.
+    #[serde(default)]
+    pub transcription_target_migration_version: u32,
+    /// Highest completed secret-store migration step (0 = none yet).
+    #[serde(default)]
+    pub secret_store_migration_version: u32,
+    /// Accepted consent version per cloud provider id (provider_id -> version).
+    /// A cloud target may only be selected once the accepted version is at least
+    /// the provider's current `consent_version`. Never carries a secret.
+    #[serde(default)]
+    pub cloud_provider_consents: HashMap<String, u32>,
 }
 
 impl std::fmt::Debug for AppSettings {
@@ -469,6 +489,7 @@ impl std::fmt::Debug for AppSettings {
             .field("typing_tool", &self.typing_tool)
             .field("external_script_path", &self.external_script_path)
             .field("long_audio_model", &self.long_audio_model)
+            .field("long_audio_target", &self.long_audio_target)
             .field(
                 "long_audio_threshold_seconds",
                 &self.long_audio_threshold_seconds,
@@ -483,6 +504,19 @@ impl std::fmt::Debug for AppSettings {
             .field("saved_processing_models", &self.saved_processing_models)
             .field("cpu_threads", &self.cpu_threads)
             .field("preload_model_on_startup", &self.preload_model_on_startup)
+            .field(
+                "selected_transcription_target",
+                &self.selected_transcription_target,
+            )
+            .field(
+                "transcription_target_migration_version",
+                &self.transcription_target_migration_version,
+            )
+            .field(
+                "secret_store_migration_version",
+                &self.secret_store_migration_version,
+            )
+            .field("cloud_provider_consents", &self.cloud_provider_consents)
             .finish()
     }
 }
@@ -725,6 +759,44 @@ fn default_preload_model() -> bool {
     false
 }
 
+fn legacy_transcription_target(
+    model_id: &str,
+    gemini_model: &str,
+) -> Option<crate::transcription::types::TranscriptionTargetId> {
+    if model_id.is_empty() {
+        None
+    } else if model_id == "gemini-api" {
+        Some(crate::transcription::types::TranscriptionTargetId::new(
+            "gemini",
+            gemini_model,
+        ))
+    } else {
+        Some(crate::transcription::types::TranscriptionTargetId::new(
+            "local", model_id,
+        ))
+    }
+}
+
+/// Upgrade pre-provider settings without changing an already explicit choice.
+fn migrate_transcription_targets(settings: &mut AppSettings) -> bool {
+    const CURRENT_TARGET_MIGRATION_VERSION: u32 = 1;
+    if settings.transcription_target_migration_version >= CURRENT_TARGET_MIGRATION_VERSION {
+        return false;
+    }
+    if settings.selected_transcription_target.is_none() {
+        settings.selected_transcription_target =
+            legacy_transcription_target(&settings.selected_model, &settings.gemini_model);
+    }
+    if settings.long_audio_target.is_none() {
+        settings.long_audio_target = settings
+            .long_audio_model
+            .as_deref()
+            .and_then(|model_id| legacy_transcription_target(model_id, &settings.gemini_model));
+    }
+    settings.transcription_target_migration_version = CURRENT_TARGET_MIGRATION_VERSION;
+    true
+}
+
 fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
     let mut changed = false;
     for provider in default_post_process_providers() {
@@ -910,6 +982,7 @@ pub fn get_default_settings() -> AppSettings {
         typing_tool: default_typing_tool(),
         external_script_path: None,
         long_audio_model: None,
+        long_audio_target: None,
         long_audio_threshold_seconds: default_long_audio_threshold_seconds(),
         gemini_api_key: None,
         gemini_model: default_gemini_model(),
@@ -918,10 +991,36 @@ pub fn get_default_settings() -> AppSettings {
         saved_processing_models: Vec::new(),
         cpu_threads: default_cpu_threads(),
         preload_model_on_startup: default_preload_model(),
+        selected_transcription_target: None,
+        transcription_target_migration_version: 1,
+        secret_store_migration_version: 0,
+        cloud_provider_consents: HashMap::new(),
     }
 }
 
 impl AppSettings {
+    /// Return the automatic long-audio fallback only when both ends are local.
+    /// Cloud failures and local/cloud transitions require explicit user action.
+    pub fn long_audio_fallback_target(
+        &self,
+    ) -> Option<&crate::transcription::types::TranscriptionTargetId> {
+        let selected = self.selected_transcription_target.as_ref()?;
+        let fallback = self.long_audio_target.as_ref()?;
+        (selected.provider_id == "local" && fallback.provider_id == "local").then_some(fallback)
+    }
+
+    /// A copy safe to write to an export file: all credential material is
+    /// removed. `gemini_api_key` is cleared and every post-process API key value
+    /// is emptied while preserving the provider ids (which are not secret).
+    pub fn export_snapshot(&self) -> AppSettings {
+        let mut copy = self.clone();
+        copy.gemini_api_key = None;
+        for value in copy.post_process_api_keys.values_mut() {
+            value.clear();
+        }
+        copy
+    }
+
     pub fn active_post_process_provider(&self) -> Option<&PostProcessProvider> {
         self.post_process_providers
             .iter()
@@ -970,8 +1069,12 @@ pub fn load_or_create_app_settings(app: &AppHandle) -> AppSettings {
                     }
                 }
 
+                if migrate_transcription_targets(&mut settings) {
+                    updated = true;
+                }
+
                 if updated {
-                    debug!("Settings updated with new bindings");
+                    debug!("Settings updated with defaults and transcription targets");
                     store.set("settings", serde_json::to_value(&settings).unwrap());
                 }
 
@@ -991,7 +1094,9 @@ pub fn load_or_create_app_settings(app: &AppHandle) -> AppSettings {
         default_settings
     };
 
-    if ensure_post_process_defaults(&mut settings) {
+    let defaults_updated = ensure_post_process_defaults(&mut settings);
+    let targets_migrated = migrate_transcription_targets(&mut settings);
+    if defaults_updated || targets_migrated {
         store.set("settings", serde_json::to_value(&settings).unwrap());
     }
 
@@ -1015,7 +1120,9 @@ pub fn get_settings(app: &AppHandle) -> AppSettings {
         default_settings
     };
 
-    if ensure_post_process_defaults(&mut settings) {
+    let defaults_updated = ensure_post_process_defaults(&mut settings);
+    let targets_migrated = migrate_transcription_targets(&mut settings);
+    if defaults_updated || targets_migrated {
         store.set("settings", serde_json::to_value(&settings).unwrap());
     }
 
@@ -1059,6 +1166,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn migrates_legacy_selected_model_to_explicit_local_target() {
+        let mut settings = get_default_settings();
+        settings.transcription_target_migration_version = 0;
+        settings.selected_model = "parakeet-tdt-0.6b-v3".into();
+
+        assert!(migrate_transcription_targets(&mut settings));
+        assert_eq!(
+            settings.selected_transcription_target,
+            Some(crate::transcription::TranscriptionTargetId::new(
+                "local",
+                "parakeet-tdt-0.6b-v3"
+            ))
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_gemini_model_without_overwriting_configured_model() {
+        let mut settings = get_default_settings();
+        settings.transcription_target_migration_version = 0;
+        settings.selected_model = "gemini-api".into();
+        settings.gemini_model = "gemini-custom-preview".into();
+
+        assert!(migrate_transcription_targets(&mut settings));
+        assert_eq!(
+            settings.selected_transcription_target,
+            Some(crate::transcription::TranscriptionTargetId::new(
+                "gemini",
+                "gemini-custom-preview"
+            ))
+        );
+    }
+
+    #[test]
+    fn migrates_legacy_long_audio_model_and_only_allows_local_fallback() {
+        let mut settings = get_default_settings();
+        settings.transcription_target_migration_version = 0;
+        settings.selected_transcription_target = Some(
+            crate::transcription::TranscriptionTargetId::new("local", "moonshine-base"),
+        );
+        settings.long_audio_model = Some("large".into());
+
+        assert!(migrate_transcription_targets(&mut settings));
+        assert_eq!(
+            settings.long_audio_fallback_target(),
+            Some(&crate::transcription::TranscriptionTargetId::new(
+                "local", "large"
+            ))
+        );
+
+        settings.selected_transcription_target = Some(
+            crate::transcription::TranscriptionTargetId::new("elevenlabs", "scribe_v2"),
+        );
+        assert_eq!(settings.long_audio_fallback_target(), None);
+    }
+
+    #[test]
+    fn explicitly_cleared_target_is_not_recreated_after_migration() {
+        let mut settings = get_default_settings();
+        settings.selected_model = "parakeet-tdt-0.6b-v3".into();
+        settings.selected_transcription_target = None;
+
+        assert!(!migrate_transcription_targets(&mut settings));
+        assert!(settings.selected_transcription_target.is_none());
+    }
+
+    #[test]
     fn default_settings_disable_auto_submit() {
         let settings = get_default_settings();
         assert!(!settings.auto_submit);
@@ -1087,5 +1260,21 @@ mod tests {
         assert!(
             output.contains("post_process_api_keys: {\"provider-id-sentinel\": \"[REDACTED]\"}")
         );
+    }
+
+    #[test]
+    fn export_snapshot_strips_all_secret_material() {
+        let mut settings = get_default_settings();
+        settings.gemini_api_key = Some("gemini-secret-sentinel".into());
+        settings.post_process_api_keys.clear();
+        settings
+            .post_process_api_keys
+            .insert("openai".into(), "openai-secret-sentinel".into());
+
+        let json = serde_json::to_string(&settings.export_snapshot()).unwrap();
+        assert!(!json.contains("gemini-secret-sentinel"));
+        assert!(!json.contains("openai-secret-sentinel"));
+        // Provider ids are preserved (not secret) so import keeps the layout.
+        assert!(json.contains("openai"));
     }
 }

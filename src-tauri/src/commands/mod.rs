@@ -4,6 +4,7 @@ pub mod hardware;
 pub mod history;
 pub mod insanely_fast_whisper;
 pub mod models;
+pub mod providers;
 pub mod secrets;
 pub mod transcription;
 
@@ -45,7 +46,11 @@ pub fn get_app_dir_path(app: AppHandle) -> Result<String, String> {
 #[tauri::command]
 #[specta::specta]
 pub fn get_app_settings(app: AppHandle) -> Result<AppSettings, String> {
-    Ok(get_settings(&app))
+    let mut settings = get_settings(&app);
+    // Legacy values may remain on disk when keyring migration is blocked, but
+    // credential material must never cross the Tauri boundary.
+    crate::secrets::migration::clear_legacy_plaintext(&mut settings);
+    Ok(settings)
 }
 
 #[tauri::command]
@@ -136,7 +141,8 @@ pub fn open_app_data_dir(app: AppHandle) -> Result<(), String> {
 #[specta::specta]
 #[tauri::command]
 pub fn export_settings(app: AppHandle, path: String) -> Result<(), String> {
-    let settings = get_settings(&app);
+    // Never export credential material: strip secrets before serializing.
+    let settings = get_settings(&app).export_snapshot();
     let json = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
     std::fs::write(&path, json).map_err(|e| format!("Failed to write file: {}", e))?;
@@ -144,12 +150,53 @@ pub fn export_settings(app: AppHandle, path: String) -> Result<(), String> {
     Ok(())
 }
 
+fn sanitize_imported_settings(settings: &mut AppSettings) {
+    crate::secrets::migration::clear_legacy_plaintext(settings);
+    settings.cloud_provider_consents.clear();
+
+    // Legacy cloud pseudo-models are privileged configuration too: leaving one
+    // here would let the one-time target migration recreate a cloud selection.
+    if settings.selected_model == "gemini-api" {
+        settings.selected_model.clear();
+    }
+    if settings.long_audio_model.as_deref() == Some("gemini-api") {
+        settings.long_audio_model = None;
+    }
+    if settings
+        .selected_transcription_target
+        .as_ref()
+        .is_some_and(|target| target.provider_id != "local")
+    {
+        settings.selected_transcription_target = None;
+    }
+    if settings
+        .long_audio_target
+        .as_ref()
+        .is_some_and(|target| target.provider_id != "local")
+    {
+        settings.long_audio_target = None;
+    }
+    if settings.selected_transcription_target.is_none() && !settings.selected_model.is_empty() {
+        settings.selected_transcription_target =
+            Some(crate::transcription::TranscriptionTargetId::new(
+                "local",
+                settings.selected_model.clone(),
+            ));
+    }
+    settings.transcription_target_migration_version = 1;
+    settings.secret_store_migration_version = crate::secrets::migration::CURRENT_MIGRATION_VERSION;
+}
+
 #[specta::specta]
 #[tauri::command]
 pub fn import_settings(app: AppHandle, path: String) -> Result<(), String> {
     let json = std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))?;
-    let settings: AppSettings =
+    let mut settings: AppSettings =
         serde_json::from_str(&json).map_err(|e| format!("Invalid settings file: {}", e))?;
+    // Imported files are configuration only. Never persist credential material,
+    // including values from legacy exports. Consent and cloud activation are
+    // likewise local, interactive decisions and cannot be imported.
+    sanitize_imported_settings(&mut settings);
     write_settings(&app, settings);
     log::info!("Settings imported from {}", path);
     Ok(())
@@ -227,4 +274,52 @@ pub fn initialize_shortcuts(app: AppHandle) -> Result<(), String> {
 
     log::info!("Shortcuts initialized successfully");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcription::TranscriptionTargetId;
+
+    #[test]
+    fn imported_cloud_activation_and_consent_are_stripped() {
+        let mut settings = crate::settings::get_default_settings();
+        settings.gemini_api_key = Some("legacy-secret".into());
+        settings
+            .post_process_api_keys
+            .insert("openai".into(), "legacy-secret-2".into());
+        settings
+            .cloud_provider_consents
+            .insert("elevenlabs".into(), 99);
+        settings.selected_model = "gemini-api".into();
+        settings.long_audio_model = Some("gemini-api".into());
+        settings.long_audio_target = Some(TranscriptionTargetId::new("gemini", "legacy"));
+        settings.selected_transcription_target =
+            Some(TranscriptionTargetId::new("elevenlabs", "scribe_v2"));
+
+        sanitize_imported_settings(&mut settings);
+
+        assert!(settings.gemini_api_key.is_none());
+        assert!(settings
+            .post_process_api_keys
+            .values()
+            .all(String::is_empty));
+        assert!(settings.cloud_provider_consents.is_empty());
+        assert!(settings.selected_transcription_target.is_none());
+        assert!(settings.selected_model.is_empty());
+        assert!(settings.long_audio_model.is_none());
+        assert!(settings.long_audio_target.is_none());
+        assert_eq!(settings.transcription_target_migration_version, 1);
+    }
+
+    #[test]
+    fn imported_local_target_is_preserved() {
+        let mut settings = crate::settings::get_default_settings();
+        let target = TranscriptionTargetId::new("local", "whisper-small");
+        settings.selected_transcription_target = Some(target.clone());
+
+        sanitize_imported_settings(&mut settings);
+
+        assert_eq!(settings.selected_transcription_target, Some(target));
+    }
 }

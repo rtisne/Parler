@@ -24,7 +24,6 @@ pub enum EngineType {
     Moonshine,
     MoonshineStreaming,
     SenseVoice,
-    GeminiApi,
     InsanelyFastWhisper,
 }
 
@@ -449,31 +448,6 @@ impl ModelManager {
         );
 
         available_models.insert(
-            "gemini-api".to_string(),
-            ModelInfo {
-                id: "gemini-api".to_string(),
-                name: "Gemini API".to_string(),
-                description:
-                    "Cloud-based transcription via Google Gemini. Requires API key and internet."
-                        .to_string(),
-                filename: "".to_string(),
-                url: None,
-                size_mb: 0,
-                is_downloaded: true,
-                is_downloading: false,
-                partial_size: 0,
-                is_directory: false,
-                engine_type: EngineType::GeminiApi,
-                accuracy_score: 0.9,
-                speed_score: 0.7,
-                supports_translation: false,
-                is_recommended: false,
-                supported_languages: whisper_languages.clone(),
-                is_custom: false,
-            },
-        );
-
-        available_models.insert(
             "insanely-fast-whisper".to_string(),
             ModelInfo {
                 id: "insanely-fast-whisper".to_string(),
@@ -635,10 +609,7 @@ impl ModelManager {
         let mut models = self.available_models.lock().unwrap();
 
         for model in models.values_mut() {
-            if matches!(
-                model.engine_type,
-                EngineType::GeminiApi | EngineType::InsanelyFastWhisper
-            ) {
+            if matches!(model.engine_type, EngineType::InsanelyFastWhisper) {
                 continue;
             }
             if model.is_directory {
@@ -705,6 +676,13 @@ impl ModelManager {
                     settings.selected_model
                 );
                 settings.selected_model = String::new();
+                if settings
+                    .selected_transcription_target
+                    .as_ref()
+                    .is_some_and(|target| target.provider_id == "local")
+                {
+                    settings.selected_transcription_target = None;
+                }
                 write_settings(&self.app_handle, settings.clone());
             }
         }
@@ -714,11 +692,7 @@ impl ModelManager {
         if settings.selected_model.is_empty() {
             let models = self.available_models.lock().unwrap();
             if let Some(available_model) = models.values().find(|model| {
-                model.is_downloaded
-                    && !matches!(
-                        model.engine_type,
-                        EngineType::GeminiApi | EngineType::InsanelyFastWhisper
-                    )
+                model.is_downloaded && !matches!(model.engine_type, EngineType::InsanelyFastWhisper)
             }) {
                 info!(
                     "Auto-selecting model: {} ({})",
@@ -728,6 +702,17 @@ impl ModelManager {
                 // Update settings with the selected model
                 let mut updated_settings = settings;
                 updated_settings.selected_model = available_model.id.clone();
+                if updated_settings
+                    .selected_transcription_target
+                    .as_ref()
+                    .is_none_or(|target| target.provider_id == "local")
+                {
+                    updated_settings.selected_transcription_target =
+                        Some(crate::transcription::TranscriptionTargetId::new(
+                            "local",
+                            available_model.id.clone(),
+                        ));
+                }
                 write_settings(&self.app_handle, updated_settings);
 
                 info!("Successfully auto-selected model: {}", available_model.id);
@@ -865,10 +850,7 @@ impl ModelManager {
         let model_info =
             model_info.ok_or_else(|| anyhow::anyhow!("Model not found: {}", model_id))?;
 
-        if matches!(
-            model_info.engine_type,
-            EngineType::GeminiApi | EngineType::InsanelyFastWhisper
-        ) {
+        if matches!(model_info.engine_type, EngineType::InsanelyFastWhisper) {
             return Ok(());
         }
 
@@ -1224,10 +1206,7 @@ impl ModelManager {
         let model_info =
             model_info.ok_or_else(|| anyhow::anyhow!("Model not found: {}", model_id))?;
 
-        if matches!(
-            model_info.engine_type,
-            EngineType::GeminiApi | EngineType::InsanelyFastWhisper
-        ) {
+        if matches!(model_info.engine_type, EngineType::InsanelyFastWhisper) {
             return Err(anyhow::anyhow!("Cannot delete cloud model"));
         }
 
@@ -1295,10 +1274,7 @@ impl ModelManager {
             .get_model_info(model_id)
             .ok_or_else(|| anyhow::anyhow!("Model not found: {}", model_id))?;
 
-        if matches!(
-            model_info.engine_type,
-            EngineType::GeminiApi | EngineType::InsanelyFastWhisper
-        ) {
+        if matches!(model_info.engine_type, EngineType::InsanelyFastWhisper) {
             return Err(anyhow::anyhow!(
                 "Cloud model has no local path: {}",
                 model_id

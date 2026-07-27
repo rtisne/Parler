@@ -30,18 +30,26 @@ fn store_error_to_string(err: SecretStoreError) -> String {
     err.to_string()
 }
 
-fn set_credential(
+/// Store a credential after the same fail-closed validation every write path
+/// (the generic command, the Gemini command, ...) must apply. Blank/whitespace
+/// values are rejected here as a defensive check for callers; [`SecretStore::set_secret`]
+/// also enforces this at the storage layer so no backend can ever persist one.
+pub(crate) fn set_credential(
     store: &dyn SecretStore,
     provider_id: &str,
     secret: &str,
 ) -> Result<(), SecretStoreError> {
+    let secret = secret.trim();
     if secret.is_empty() {
         return Err(SecretStoreError::InvalidSecret);
     }
     store.set_secret(provider_id, secret)
 }
 
-fn delete_credential(store: &dyn SecretStore, provider_id: &str) -> Result<(), SecretStoreError> {
+pub(crate) fn delete_credential(
+    store: &dyn SecretStore,
+    provider_id: &str,
+) -> Result<(), SecretStoreError> {
     store.delete_secret(provider_id)
 }
 
@@ -79,7 +87,20 @@ pub fn set_provider_credential(
 #[specta::specta]
 pub fn delete_provider_credential(app: AppHandle, provider_id: String) -> Result<(), String> {
     let store = app.state::<SharedSecretStore>();
-    delete_credential(store.inner().as_ref(), &provider_id).map_err(store_error_to_string)
+    delete_credential(store.inner().as_ref(), &provider_id).map_err(store_error_to_string)?;
+
+    // Credential removal and target deactivation are one backend operation from
+    // the UI's perspective: a target must never remain active without its key.
+    let mut settings = crate::settings::get_settings(&app);
+    if settings
+        .selected_transcription_target
+        .as_ref()
+        .is_some_and(|target| target.provider_id == provider_id)
+    {
+        settings.selected_transcription_target = None;
+        crate::settings::write_settings(&app, settings);
+    }
+    Ok(())
 }
 
 /// Report whether a credential is configured for `provider_id` and whether the
@@ -122,6 +143,23 @@ mod tests {
         let store = MemorySecretStore::new();
         assert!(set_credential(&store, "p", "").is_err());
         assert!(!credential_status(&store, "p").unwrap().configured);
+    }
+
+    #[test]
+    fn whitespace_only_secret_is_rejected() {
+        let store = MemorySecretStore::new();
+        assert_eq!(
+            set_credential(&store, "p", "   \t  "),
+            Err(SecretStoreError::InvalidSecret)
+        );
+        assert!(!credential_status(&store, "p").unwrap().configured);
+    }
+
+    #[test]
+    fn secret_with_surrounding_whitespace_is_stored_trimmed() {
+        let store = MemorySecretStore::new();
+        set_credential(&store, "p", "  sk-abc  ").unwrap();
+        assert_eq!(store.get_secret("p").unwrap(), "sk-abc");
     }
 
     #[test]

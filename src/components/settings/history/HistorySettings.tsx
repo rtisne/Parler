@@ -247,6 +247,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   const [showCopied, setShowCopied] = useState(false);
   const [showModelPicker, setShowModelPicker] = useState(false);
   const [reprocessing, setReprocessing] = useState(false);
+  const [reprocessError, setReprocessError] = useState(false);
   const pickerRef = useRef<HTMLDivElement>(null);
   const models = useModelStore((s) => s.models);
 
@@ -284,6 +285,22 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
     }
   };
 
+  const failedCloudEntry =
+    !entry.transcription_text && entry.model_name?.includes("/");
+
+  const handleCloudRetry = async () => {
+    setReprocessing(true);
+    setReprocessError(false);
+    try {
+      const result = await commands.retryCloudHistoryEntry(entry.id);
+      if (result.status !== "ok") setReprocessError(true);
+    } catch {
+      setReprocessError(true);
+    } finally {
+      setReprocessing(false);
+    }
+  };
+
   useEffect(() => {
     if (!showModelPicker) return;
     const handleClickOutside = (e: MouseEvent) => {
@@ -311,15 +328,19 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
         <div className="flex items-center gap-1">
           <div className="relative" ref={pickerRef}>
             <button
-              onClick={() =>
-                !reprocessing && setShowModelPicker(!showModelPicker)
-              }
+              onClick={() => {
+                if (reprocessing) return;
+                if (failedCloudEntry) void handleCloudRetry();
+                else setShowModelPicker(!showModelPicker);
+              }}
               disabled={reprocessing}
               className="p-2 rounded-md text-text/50 hover:text-logo-primary transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
               title={
                 reprocessing
                   ? t("settings.history.reprocessing")
-                  : t("settings.history.reprocess")
+                  : failedCloudEntry
+                    ? t("settings.history.retryCloud")
+                    : t("settings.history.reprocess")
               }
             >
               {reprocessing ? (
@@ -328,22 +349,29 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
                 <RefreshCw width={16} height={16} />
               )}
             </button>
-            {showModelPicker && downloadedModels.length > 0 && (
-              <div className="absolute right-0 top-full mt-1 z-50 bg-background border border-mid-gray/20 rounded-lg shadow-lg py-1 min-w-[200px]">
-                <p className="px-3 py-1 text-xs text-text/50 font-medium">
-                  {t("settings.history.selectModel")}
-                </p>
-                {downloadedModels.map((model) => (
-                  <button
-                    key={model.id}
-                    onClick={() => handleReprocess(model.id)}
-                    className="w-full text-left px-3 py-1.5 text-sm hover:bg-mid-gray/10 transition-colors cursor-pointer"
-                  >
-                    {model.name}
-                  </button>
-                ))}
-              </div>
-            )}
+            {showModelPicker &&
+              !failedCloudEntry &&
+              downloadedModels.length > 0 && (
+                <div className="absolute right-0 top-full mt-1 z-50 bg-background border border-mid-gray/20 rounded-lg shadow-lg py-1 min-w-[200px]">
+                  <p className="px-3 py-1 text-xs text-text/50 font-medium">
+                    {t("settings.history.selectModel")}
+                  </p>
+                  {downloadedModels.map((model) => (
+                    <button
+                      key={model.id}
+                      onClick={() => handleReprocess(model.id)}
+                      className="w-full text-left px-3 py-1.5 text-sm hover:bg-mid-gray/10 transition-colors cursor-pointer"
+                    >
+                      {model.name}
+                    </button>
+                  ))}
+                </div>
+              )}
+            {reprocessError ? (
+              <p className="absolute right-0 top-full z-50 mt-1 min-w-48 rounded bg-red-500/10 p-2 text-xs text-red-500">
+                {t("settings.history.retryCloudFailed")}
+              </p>
+            ) : null}
           </div>
           <button
             onClick={handleCopyText}

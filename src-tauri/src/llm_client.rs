@@ -84,6 +84,20 @@ fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<Header
     Ok(headers)
 }
 
+/// Build a status-only error message for a non-success response.
+///
+/// The remote body is never read: a post-processing provider's error payload
+/// can echo request content (including the transcribed text being
+/// processed), so reading it would risk leaking potentially sensitive data
+/// into the UI/logs and lets a remote server force an unbounded allocation.
+/// The response (and its connection) is dropped unread; reqwest closes the
+/// connection rather than reuse it, which is an acceptable trade-off for not
+/// consuming an attacker-controlled body.
+fn sanitized_status_error(response: &reqwest::Response, prefix: &str) -> String {
+    let status = response.status();
+    format!("{prefix} (status {status})")
+}
+
 /// Create an HTTP client with provider-specific headers
 fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwest::Client, String> {
     let headers = build_headers(provider, api_key)?;
@@ -173,16 +187,8 @@ pub async fn send_chat_completion_with_schema(
         .await
         .map_err(|e| format!("HTTP request failed: {}", e))?;
 
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Failed to read error response".to_string());
-        return Err(format!(
-            "API request failed with status {}: {}",
-            status, error_text
-        ));
+    if !response.status().is_success() {
+        return Err(sanitized_status_error(&response, "API request failed"));
     }
 
     let completion: ChatCompletionResponse = response
@@ -220,15 +226,10 @@ pub async fn fetch_models(
         .await
         .map_err(|e| format!("Failed to fetch models: {}", e))?;
 
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(format!(
-            "Model list request failed ({}): {}",
-            status, error_text
+    if !response.status().is_success() {
+        return Err(sanitized_status_error(
+            &response,
+            "Model list request failed",
         ));
     }
 
@@ -272,15 +273,10 @@ async fn fetch_gemini_models(api_key: &str) -> Result<Vec<String>, String> {
         .await
         .map_err(|e| format!("Failed to fetch Gemini models: {}", e))?;
 
-    let status = response.status();
-    if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        return Err(format!(
-            "Gemini model list request failed ({}): {}",
-            status, error_text
+    if !response.status().is_success() {
+        return Err(sanitized_status_error(
+            &response,
+            "Gemini model list request failed",
         ));
     }
 
@@ -303,4 +299,134 @@ async fn fetch_gemini_models(api_key: &str) -> Result<Vec<String>, String> {
     }
 
     Ok(models)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    /// A value that must never appear in a returned/logged error: providers
+    /// can echo request content (potentially transcribed user speech) in
+    /// their error bodies.
+    const SENTINEL: &str = "super-secret-transcription-sentinel-should-never-leak";
+
+    /// Minimal one-shot local HTTP server, mirroring the pattern already used
+    /// by the ElevenLabs/Gemini transcription client tests.
+    fn spawn_mock(response: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(100)));
+                let mut buf = [0u8; 4096];
+                loop {
+                    match socket.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => break, // timeout: request fully read
+                    }
+                }
+                let _ = socket.write_all(response.as_bytes());
+                let _ = socket.flush();
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn http_response(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            status_line,
+            body.as_bytes().len(),
+            body
+        )
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    fn test_provider(base_url: String) -> PostProcessProvider {
+        PostProcessProvider {
+            id: "test-provider".into(),
+            label: "Test".into(),
+            base_url,
+            allow_base_url_edit: true,
+            models_endpoint: None,
+            supports_structured_output: false,
+        }
+    }
+
+    #[test]
+    fn sanitized_status_error_never_reads_the_body() {
+        let base_url = spawn_mock(http_response("429 Too Many Requests", SENTINEL));
+        let message = runtime().block_on(async {
+            let response = reqwest::Client::new().get(&base_url).send().await.unwrap();
+            sanitized_status_error(&response, "request failed")
+        });
+
+        assert!(!message.contains(SENTINEL), "leaked remote body: {message}");
+        assert!(message.contains("429"));
+    }
+
+    #[test]
+    fn sanitized_status_error_does_not_block_on_an_unbounded_body() {
+        // A body far larger than any reasonable buffer, and never fully sent
+        // (no Connection: close, server never finishes writing): if the
+        // status-only path ever read the body again, this would hang/alloc
+        // instead of returning immediately.
+        let huge = "x".repeat(50 * 1024 * 1024);
+        let base_url = spawn_mock(format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\n\r\n{}",
+            huge.len() * 2,
+            huge
+        ));
+        let message = runtime().block_on(async {
+            let response = reqwest::Client::new().get(&base_url).send().await.unwrap();
+            sanitized_status_error(&response, "request failed")
+        });
+        assert!(message.contains("500"));
+    }
+
+    #[test]
+    fn chat_completion_error_never_leaks_the_remote_body() {
+        let base_url = spawn_mock(http_response(
+            "401 Unauthorized",
+            &format!(r#"{{"error":"{SENTINEL}"}}"#),
+        ));
+        let provider = test_provider(base_url);
+
+        let err = runtime()
+            .block_on(send_chat_completion(
+                &provider,
+                "key".into(),
+                "model",
+                "prompt".into(),
+            ))
+            .unwrap_err();
+
+        assert!(!err.contains(SENTINEL), "error leaked remote body: {err}");
+        assert!(err.contains("401"));
+    }
+
+    #[test]
+    fn fetch_models_error_never_leaks_the_remote_body() {
+        let base_url = spawn_mock(http_response(
+            "500 Internal Server Error",
+            &format!(r#"{{"error":"{SENTINEL}"}}"#),
+        ));
+        let provider = test_provider(base_url);
+
+        let err = runtime()
+            .block_on(fetch_models(&provider, "key".into()))
+            .unwrap_err();
+
+        assert!(!err.contains(SENTINEL), "error leaked remote body: {err}");
+    }
 }
